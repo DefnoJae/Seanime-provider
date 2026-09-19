@@ -3,6 +3,7 @@
 class Provider {
   constructor() {
     this.base = "https://www.miruro.tv";
+    this.anilist = "https://graphql.anilist.co";
   }
 
   getSettings() {
@@ -12,70 +13,101 @@ class Provider {
     };
   }
 
-async search(query) {
-  const searchQuery =
-    typeof query === "string"
-      ? query
-      : query?.query || query?.title || "";
+  async search(query) {
+    const searchQuery =
+      typeof query === "string"
+        ? query
+        : query?.query || query?.title || "";
 
-  if (!searchQuery.trim()) {
-    throw new Error("Search query is empty");
+    if (!searchQuery.trim()) {
+      throw new Error("Search query is empty");
+    }
+
+    const graphqlQuery = `
+      query ($search: String) {
+        Page(page: 1, perPage: 20) {
+          media(search: $search, type: ANIME) {
+            id
+            title {
+              romaji
+              english
+            }
+          }
+        }
+      }
+    `;
+
+    const res = await fetch(this.anilist, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      body: JSON.stringify({
+        query: graphqlQuery,
+        variables: {
+          search: searchQuery.trim()
+        }
+      })
+    });
+
+    if (!res.ok) {
+      throw new Error(
+        `AniList search failed: ${res.status} ${res.statusText}`
+      );
+    }
+
+    const data = await res.json();
+
+    if (data.errors?.length) {
+      throw new Error(data.errors[0].message || "AniList search failed");
+    }
+
+    const media = data?.data?.Page?.media || [];
+
+    if (!media.length) {
+      throw new Error(`No anime found for "${searchQuery}"`);
+    }
+
+    return media.map((anime) => ({
+      id: String(anime.id),
+
+      title:
+        anime.title?.english ||
+        anime.title?.romaji ||
+        `AniList ${anime.id}`,
+
+      url: `https://anilist.co/anime/${anime.id}`,
+
+      subOrDub: "sub"
+    }));
   }
 
-  const url =
-    `${this.base}/browse?search=${encodeURIComponent(searchQuery.trim())}`;
+  async findEpisodes(id) {
+    /*
+      IMPORTANT:
 
-  const res = await fetch(url);
+      "id" is now the real AniList ID.
 
-  if (!res.ok) {
+      Example:
+          Naruto -> 20
+
+      Miruro uses this AniList ID to retrieve its episode
+      information.
+
+      We are intentionally stopping here until we confirm
+      which Miruro episode endpoint can be accessed normally
+      from Seanime without bypassing Cloudflare.
+    */
+
     throw new Error(
-      `Miruro search failed: ${res.status} ${res.statusText}`
+      `Miruro episode lookup reached successfully. AniList ID: ${id}`
     );
   }
 
-  const html = await res.text();
-
-  const results = [];
-  const seen = new Set();
-
-  const animeRegex =
-    /href=["'](\/anime\/[^"'?#]+)["'][^>]*?(?:title=["']([^"']+)["'])?/gi;
-
-  let match;
-
-  while ((match = animeRegex.exec(html)) !== null) {
-    const path = match[1];
-
-    if (seen.has(path)) continue;
-    seen.add(path);
-
-    let title = match[2] || path.split("/").filter(Boolean).pop();
-
-    title = decodeURIComponent(title)
-      .replace(/[-_]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    results.push({
-      id: path,
-      title: title,
-      url: `${this.base}${path}`,
-      subOrDub: "sub",
-    });
-  }
-
-  if (!results.length) {
-    throw new Error(`No Miruro results found for "${searchQuery}"`);
-  }
-
-  return results;
-}
-
-  async findEpisodes(id) {
-    throw new Error("Miruro episode lookup not implemented yet");
-  }
-
   async findEpisodeServer(episode, server) {
-    throw new Error("Miruro stream resolver not implemented yet");
+    throw new Error(
+      "Miruro stream resolver not implemented yet"
+    );
   }
 }
