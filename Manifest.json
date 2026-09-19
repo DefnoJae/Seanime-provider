@@ -1,7 +1,7 @@
 {
   "id": "miruro-online-streaming",
   "name": "Miruro",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Miruro online streaming provider for Seanime.",
   "author": "Jae",
   "type": "onlinestream-provider",
