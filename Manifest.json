@@ -1,1 +1,11 @@
-
+{
+  "id": "miruro-online-streaming",
+  "name": "Miruro",
+  "version": "1.0.0",
+  "description": "Miruro online streaming provider for Seanime.",
+  "author": "Jae",
+  "type": "onlinestream-provider",
+  "language": "javascript",
+  "lang": "en",
+  "payloadURI": "./provider.js"
+}
