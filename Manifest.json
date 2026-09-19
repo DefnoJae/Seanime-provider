@@ -1,11 +1,12 @@
 {
   "id": "miruro-online-streaming",
   "name": "Miruro",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Miruro online streaming provider for Seanime.",
   "author": "Jae",
   "type": "onlinestream-provider",
   "language": "javascript",
   "lang": "en",
+  "manifestURI": "https://raw.githubusercontent.com/DefnoJae/Seanime-provider/refs/heads/main/Manifest.json",
   "payloadURI": "https://raw.githubusercontent.com/DefnoJae/Seanime-provider/refs/heads/main/Provider.js"
 }
