@@ -7,5 +7,5 @@
   "type": "onlinestream-provider",
   "language": "javascript",
   "lang": "en",
-  "payloadURI": "./provider.js"
+  "payloadURI": "https://raw.githubusercontent.com/DefnoJae/Seanime-provider/refs/heads/main/Provider.js"
 }
