@@ -4,9 +4,8 @@ class Provider {
   constructor() {
     this.anilist = "https://graphql.anilist.co";
 
-    // MiruroAPI base URL.
-    // Change this if you host MiruroAPI somewhere else.
-    this.api = "http://127.0.0.1:3000";
+    // Backend URL referenced by Miruro's official repository.
+    this.api = "https://public-miruro-consumet-api.vercel.app";
   }
 
   getSettings() {
@@ -71,9 +70,7 @@ class Provider {
     const media = data?.data?.Page?.media || [];
 
     if (!media.length) {
-      throw new Error(
-        `No anime found for "${searchQuery}"`
-      );
+      throw new Error(`No anime found for "${searchQuery}"`);
     }
 
     return media.map((anime) => ({
@@ -97,13 +94,21 @@ class Provider {
       .trim();
 
     if (!anilistId || !/^\d+$/.test(anilistId)) {
-      throw new Error(
-        `Invalid AniList ID received: ${id}`
-      );
+      throw new Error(`Invalid AniList ID received: ${id}`);
     }
 
+    /*
+      Miruro's frontend uses:
+
+      meta/anilist/episodes/{animeId}
+        ?provider=gogoanime
+        &dub=false
+    */
+
     const url =
-      `${this.api}/api/episodes/${encodeURIComponent(anilistId)}`;
+      `${this.api}/meta/anilist/episodes/` +
+      `${encodeURIComponent(anilistId)}` +
+      `?provider=gogoanime&dub=false`;
 
     const res = await fetch(url, {
       method: "GET",
@@ -114,66 +119,54 @@ class Provider {
 
     if (!res.ok) {
       throw new Error(
-        `MiruroAPI episode request failed: ${res.status} ${res.statusText}`
+        `Miruro episode request failed: ${res.status} ${res.statusText}`
       );
     }
 
     const data = await res.json();
 
-    const providers =
-      data?.results?.providers ||
-      data?.providers ||
-      {};
-
-    if (!providers || typeof providers !== "object") {
-      throw new Error(
-        "MiruroAPI returned no provider data"
-      );
-    }
-
     /*
-      Pick the first provider that contains
-      usable SUB episodes.
+      Be tolerant of a few possible response wrappers.
     */
+    let rawEpisodes = [];
 
-    let selectedProvider = null;
-    let selectedEpisodes = [];
-
-    for (const [providerName, providerData] of Object.entries(providers)) {
-      const episodes = providerData?.episodes;
-
-      if (!episodes) {
-        continue;
-      }
-
-      let list = [];
-
-      if (Array.isArray(episodes?.sub)) {
-        list = episodes.sub;
-      } else if (Array.isArray(episodes)) {
-        list = episodes;
-      }
-
-      if (list.length > 0) {
-        selectedProvider = providerName;
-        selectedEpisodes = list;
-        break;
-      }
+    if (Array.isArray(data)) {
+      rawEpisodes = data;
+    } else if (Array.isArray(data?.episodes)) {
+      rawEpisodes = data.episodes;
+    } else if (Array.isArray(data?.results)) {
+      rawEpisodes = data.results;
+    } else if (Array.isArray(data?.data?.episodes)) {
+      rawEpisodes = data.data.episodes;
+    } else if (Array.isArray(data?.data)) {
+      rawEpisodes = data.data;
     }
 
-    if (!selectedProvider || !selectedEpisodes.length) {
+    if (!rawEpisodes.length) {
       throw new Error(
-        `No SUB episodes found for AniList ID ${anilistId}`
+        `Miruro returned no episodes for AniList ID ${anilistId}`
       );
     }
 
-    return selectedEpisodes.map((ep, index) => {
+    return rawEpisodes.map((ep, index) => {
       const episodeNumber =
-        Number(ep?.number) || index + 1;
+        Number(
+          ep?.number ??
+          ep?.episodeNumber ??
+          ep?.episode ??
+          index + 1
+        ) || index + 1;
 
       const episodeId =
-        ep?.id ||
-        `watch/${selectedProvider}/${anilistId}/sub/${episodeNumber}`;
+        ep?.id ??
+        ep?.episodeId ??
+        ep?.url;
+
+      if (!episodeId) {
+        throw new Error(
+          `Miruro episode ${episodeNumber} has no episode ID`
+        );
+      }
 
       return {
         id: String(episodeId),
@@ -187,27 +180,25 @@ class Provider {
         url: String(episodeId),
 
         thumbnail:
-          ep?.image || "",
-
-        metadata: {
-          provider: selectedProvider,
-          anilistId: anilistId,
-          category: "sub",
-        },
+          ep?.image ||
+          ep?.thumbnail ||
+          "",
       };
     });
   }
 
   async findEpisodeServer(episode, server) {
     /*
-      Episode listing is implemented.
+      Diagnostic stage.
 
-      Stream resolution is intentionally
-      left disabled for this test.
+      If we reach this function, then:
+        Seanime -> AniList -> Miruro -> episode list
+
+      is working.
     */
 
     throw new Error(
-      `Episode lookup works. Episode ${episode?.number || "?"} reached findEpisodeServer().`
+      `Miruro episode list works. Reached ${server} stream resolver for episode ${episode?.number || "?"}.`
     );
   }
 }
