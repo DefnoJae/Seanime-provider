@@ -1,8 +1,8 @@
 {
-  "id": "aniwaves-online-streaming",
-  "name": "Ani-Waves",
+  "id": "animex-online-streaming",
+  "name": "AnimeX",
   "version": "1.0.0",
-  "description": "Ani-Waves online streaming provider for Seanime.",
+  "description": "AnimeX online streaming provider for Seanime.",
   "author": "Jae",
   "type": "onlinestream-provider",
   "language": "javascript",
