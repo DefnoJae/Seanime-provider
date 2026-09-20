@@ -1,8 +1,8 @@
 {
-  "id": "miruro-online-streaming",
-  "name": "Miruro",
-  "version": "1.0.5",
-  "description": "Miruro online streaming provider for Seanime.",
+  "id": "aniwaves-online-streaming",
+  "name": "Ani-Waves",
+  "version": "1.0.0",
+  "description": "Ani-Waves online streaming provider for Seanime.",
   "author": "Jae",
   "type": "onlinestream-provider",
   "language": "javascript",
