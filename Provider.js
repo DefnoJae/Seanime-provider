@@ -4,6 +4,10 @@ class Provider {
     this.API = "https://pp.animex.one";
   }
 
+  getSettings() {
+    return {};
+  }
+
   cleanText(value) {
     return String(value || "")
       .replace(/<[^>]*>/g, "")
@@ -50,15 +54,31 @@ class Provider {
     return await response.json();
   }
 
-  async search(query) {
-    if (!query || !String(query).trim()) {
+  async search(input) {
+    let query = "";
+
+    if (typeof input === "string") {
+      query = input;
+    } else if (input && typeof input === "object") {
+      query =
+        input.query ||
+        input.title ||
+        input.search ||
+        input.keyword ||
+        input.name ||
+        "";
+    }
+
+    query = String(query).trim();
+
+    if (!query) {
       return [];
     }
 
     const url =
       this.ANIMEX +
       "/catalog?search=" +
-      encodeURIComponent(String(query).trim());
+      encodeURIComponent(query);
 
     const html = await this.getText(url);
 
@@ -78,7 +98,6 @@ class Provider {
       }
 
       const block = match[2];
-
       let title = "";
 
       const altMatch = block.match(/alt=["']([^"']+)["']/i);
@@ -131,7 +150,29 @@ class Provider {
   }
 
   async findEpisodes(id) {
-    const animeUrl = this.ANIMEX + "/anime/" + id;
+    let animeId = id;
+
+    if (id && typeof id === "object") {
+      animeId =
+        id.id ||
+        id.animeId ||
+        id.mediaId ||
+        id.url ||
+        "";
+    }
+
+    animeId = String(animeId || "");
+
+    if (animeId.indexOf("/anime/") !== -1) {
+      animeId = animeId
+        .split("/anime/")[1]
+        .split("?")[0]
+        .split("#")[0]
+        .replace(/\/$/, "");
+    }
+
+    const animeUrl =
+      this.ANIMEX + "/anime/" + animeId;
 
     const html = await this.getText(animeUrl);
 
@@ -139,13 +180,15 @@ class Provider {
 
     const episodeNumbers = [];
 
-    const escapedId = String(id).replace(
+    const escapedId = animeId.replace(
       /[.*+?^${}()|[\]\\]/g,
       "\\$&"
     );
 
     const episodeRegex = new RegExp(
-      "/watch/" + escapedId + "-episode-(\\d+)",
+      "/watch/" +
+        escapedId +
+        "-episode-(\\d+)",
       "gi"
     );
 
@@ -160,28 +203,38 @@ class Provider {
     }
 
     if (!episodeCount && episodeNumbers.length > 0) {
-      episodeCount = Math.max.apply(null, episodeNumbers);
+      episodeCount = Math.max.apply(
+        null,
+        episodeNumbers
+      );
     }
 
     if (!episodeCount) {
       throw new Error(
         'AnimeX could not determine episode count for "' +
-          id +
+          animeId +
           '".'
       );
     }
 
     const episodes = [];
 
-    for (let number = 1; number <= episodeCount; number++) {
+    for (
+      let number = 1;
+      number <= episodeCount;
+      number++
+    ) {
       episodes.push({
-        id: id + "-episode-" + number,
+        id:
+          animeId +
+          "-episode-" +
+          number,
         title: "Episode " + number,
         number: number,
         url:
           this.ANIMEX +
           "/watch/" +
-          id +
+          animeId +
           "-episode-" +
           number,
       });
@@ -207,10 +260,6 @@ class Provider {
       }
     }
 
-    /*
-     * AnimeX page data can also expose the internal player
-     * identifier as access_id or embedId.
-     */
     let match = html.match(
       /["']access_id["']\s*:\s*["']([^"']+)["']/i
     );
@@ -234,10 +283,17 @@ class Provider {
       };
     }
 
-    throw new Error("AnimeX player ID could not be found.");
+    throw new Error(
+      "AnimeX player ID could not be found."
+    );
   }
 
-  async getSources(id, episodeNumber, type, providerId) {
+  async getSources(
+    id,
+    episodeNumber,
+    type,
+    providerId
+  ) {
     const url =
       this.API +
       "/rest/api/sources" +
@@ -274,23 +330,64 @@ class Provider {
   }
 
   async findEpisodeServer(episode, server) {
-    const html = await this.getText(episode.url);
+    let episodeObject = episode;
+
+    if (
+      !episodeObject ||
+      typeof episodeObject !== "object"
+    ) {
+      episodeObject = {
+        id: String(episode || ""),
+        url: String(episode || ""),
+      };
+    }
+
+    let episodeUrl = episodeObject.url || "";
+
+    if (
+      episodeUrl &&
+      episodeUrl.indexOf("http") !== 0
+    ) {
+      episodeUrl =
+        this.ANIMEX +
+        (episodeUrl.charAt(0) === "/"
+          ? episodeUrl
+          : "/" + episodeUrl);
+    }
+
+    if (!episodeUrl) {
+      throw new Error(
+        "AnimeX episode URL is missing."
+      );
+    }
+
+    const html = await this.getText(episodeUrl);
 
     const player = this.extractPlayerData(html);
 
     let episodeNumber = player.episode;
 
-    if (!episodeNumber && episode.number) {
-      episodeNumber = Number(episode.number);
+    if (
+      !episodeNumber &&
+      episodeObject.number
+    ) {
+      episodeNumber = Number(
+        episodeObject.number
+      );
     }
 
-    if (!episodeNumber && episode.id) {
-      const match = String(episode.id).match(
-        /episode-(\d+)/i
-      );
+    if (
+      !episodeNumber &&
+      episodeObject.id
+    ) {
+      const numberMatch = String(
+        episodeObject.id
+      ).match(/episode-(\d+)/i);
 
-      if (match) {
-        episodeNumber = Number(match[1]);
+      if (numberMatch) {
+        episodeNumber = Number(
+          numberMatch[1]
+        );
       }
     }
 
@@ -311,9 +408,10 @@ class Provider {
       type = "dub";
     }
 
-    let requestedProvider = requestedServer
-      .replace("-sub", "")
-      .replace("-dub", "");
+    let requestedProvider =
+      requestedServer
+        .replace("-sub", "")
+        .replace("-dub", "");
 
     let providers;
 
@@ -337,28 +435,42 @@ class Provider {
 
     if (
       requestedProvider &&
-      providers.indexOf(requestedProvider) !== -1
+      providers.indexOf(
+        requestedProvider
+      ) !== -1
     ) {
-      providers = providers.filter(function (p) {
-        return p !== requestedProvider;
-      });
+      providers = providers.filter(
+        function (provider) {
+          return (
+            provider !==
+            requestedProvider
+          );
+        }
+      );
 
-      providers.unshift(requestedProvider);
+      providers.unshift(
+        requestedProvider
+      );
     }
 
     let data = null;
     let usedProvider = null;
 
-    for (let i = 0; i < providers.length; i++) {
+    for (
+      let i = 0;
+      i < providers.length;
+      i++
+    ) {
       const providerId = providers[i];
 
       try {
-        const result = await this.getSources(
-          player.id,
-          episodeNumber,
-          type,
-          providerId
-        );
+        const result =
+          await this.getSources(
+            player.id,
+            episodeNumber,
+            type,
+            providerId
+          );
 
         if (
           result &&
@@ -370,7 +482,7 @@ class Provider {
           break;
         }
       } catch (error) {
-        // Try next AnimeX provider.
+        // Try the next provider.
       }
     }
 
@@ -384,17 +496,23 @@ class Provider {
 
     const videoSources = [];
 
-    for (let i = 0; i < data.sources.length; i++) {
+    for (
+      let i = 0;
+      i < data.sources.length;
+      i++
+    ) {
       const source = data.sources[i];
 
       if (!source || !source.url) {
         continue;
       }
 
-      let sourceType = source.type || "hls";
+      let sourceType =
+        source.type || "hls";
 
       if (
-        sourceType === "video/mpegurl" ||
+        sourceType ===
+          "video/mpegurl" ||
         source.url.indexOf(".m3u8") !== -1
       ) {
         sourceType = "hls";
@@ -402,7 +520,8 @@ class Provider {
 
       videoSources.push({
         url: source.url,
-        quality: source.quality || "auto",
+        quality:
+          source.quality || "auto",
         type: sourceType,
       });
     }
@@ -410,7 +529,11 @@ class Provider {
     const subtitles = [];
 
     if (Array.isArray(data.tracks)) {
-      for (let i = 0; i < data.tracks.length; i++) {
+      for (
+        let i = 0;
+        i < data.tracks.length;
+        i++
+      ) {
         const track = data.tracks[i];
 
         if (!track || !track.url) {
@@ -426,12 +549,15 @@ class Provider {
 
         subtitles.push({
           url: track.url,
-          language: track.lang || "English",
+          language:
+            track.lang || "English",
           label:
             track.label ||
             track.lang ||
             "English",
-          default: Boolean(track.default),
+          default: Boolean(
+            track.default
+          ),
         });
       }
     }
