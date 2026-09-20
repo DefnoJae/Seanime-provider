@@ -7,7 +7,10 @@ class Provider {
   }
 
   getSettings() {
-    return {};
+    return {
+      episodeServers: ["AnimeX Sub", "AnimeX Dub"],
+      supportsDub: true,
+    };
   }
 
   async getJSON(url, options) {
@@ -298,8 +301,8 @@ class Provider {
     let providers = this.serverProviders(servers, type);
     if (!providers.length) {
       providers = type === "dub"
-        ? ["beep", "mimi", "vee", "yuki", "neko", "mochi", "uwu", "zuna", "loli", "sora"]
-        : ["beep", "mimi", "vee", "mochi", "uwu", "yuki", "neko", "zuna", "loli", "sora"];
+        ? ["yuki", "neko"]
+        : ["beep", "yuki"];
     }
 
     const requestedProvider = requested
@@ -342,31 +345,14 @@ class Provider {
       return {
         url: url,
         quality: source.quality || source.qualityLabel || source.label || "auto",
-        type: isHls ? "hls" : (source.type || source.mimeType || "mp4"),
+        type: isHls ? "m3u8" : (source.type || source.mimeType || "mp4"),
       };
     });
-
-    const subtitles = Array.isArray(responseData.tracks)
-      ? responseData.tracks.filter(function (track) {
-          const url = track && (track.url || track.file || track.link);
-          const kind = String(track && (track.kind || track.type || "")).toLowerCase();
-          return url && (kind === "captions" || kind === "subtitles" || kind === "subtitle" || kind === "cc");
-        }).map(function (track) {
-          const url = track.url || track.file || track.link;
-          return {
-            url: url,
-            language: track.lang || track.language || "English",
-            label: track.label || track.lang || track.language || "English",
-            default: Boolean(track.default),
-          };
-        })
-      : [];
 
     return {
       server: usedProvider,
       headers: responseData.headers || {},
       videoSources: videoSources,
-      subtitles: subtitles,
     };
   }
 }
