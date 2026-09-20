@@ -1,12 +1,13 @@
 {
   "id": "animex-online-streaming",
   "name": "AnimeX",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "AnimeX online streaming provider for Seanime.",
   "author": "Jae",
   "type": "onlinestream-provider",
   "language": "javascript",
   "lang": "en",
+  "icon": "https://raw.githubusercontent.com/DefnoJae/Seanime-provider/refs/heads/main/assets/logo.png",
   "manifestURI": "https://raw.githubusercontent.com/DefnoJae/Seanime-provider/refs/heads/main/Manifest.json",
   "payloadURI": "https://raw.githubusercontent.com/DefnoJae/Seanime-provider/refs/heads/main/Provider.js"
 }
