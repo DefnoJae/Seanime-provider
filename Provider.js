@@ -140,13 +140,120 @@ class Provider {
     return String(server.id || server.name || server.serverName || "").toLowerCase();
   }
 
+  normalizeProviderId(provider) {
+    if (!provider) return "";
+    const raw = typeof provider === "string"
+      ? provider
+      : String(provider && (provider.id || provider.serverName || provider.name || provider.slug || provider.key) || "");
+    return raw.toLowerCase().replace(/-(?:sub|dub)$/i, "").replace(/\s+/g, "");
+  }
+
   providerIds(value) {
-    if (!Array.isArray(value)) return [];
-    return value.map(function (provider) {
-      return typeof provider === "string"
-        ? provider.toLowerCase()
-        : String(provider && (provider.id || provider.serverName || provider.name) || "").toLowerCase();
-    }).filter(Boolean);
+    if (!value) return [];
+
+    let items = value;
+    if (typeof items === "string") {
+      items = items.split(",");
+    } else if (items && typeof items === "object" && !Array.isArray(items)) {
+      if (Array.isArray(items.providers)) {
+        items = items.providers;
+      } else if (Array.isArray(items.items)) {
+        items = items.items;
+      } else {
+        items = Object.keys(items).map(function (key) {
+          return items[key];
+        });
+      }
+    }
+
+    if (!Array.isArray(items)) return [];
+
+    const seen = {};
+    return items.map(function (provider) {
+      const id = this.normalizeProviderId(provider);
+      if (!id || seen[id]) return null;
+      seen[id] = true;
+      return id;
+    }, this).filter(Boolean);
+  }
+
+  serverProviders(servers, type) {
+    if (!servers || typeof servers !== "object") return [];
+
+    const matchKeys = [type + "Providers", type + "Provider", type + "s", type, "providers", "servers", "data"];
+    for (let i = 0; i < matchKeys.length; i++) {
+      const key = matchKeys[i];
+      const value = servers[key];
+      if (value !== undefined) {
+        const ids = this.providerIds(value);
+        if (ids.length) return ids;
+      }
+    }
+
+    const candidateKeys = Object.keys(servers);
+    for (let i = 0; i < candidateKeys.length; i++) {
+      const key = candidateKeys[i].toLowerCase();
+      if (key === type || key === type + "providers" || key === type + "provider" || key === type + "s") {
+        const ids = this.providerIds(servers[candidateKeys[i]]);
+        if (ids.length) return ids;
+      }
+    }
+
+    const values = Object.keys(servers).reduce(function (result, key) {
+      const value = servers[key];
+      if (value && typeof value === "object") {
+        result.push(value);
+      }
+      return result;
+    }, []);
+    for (let i = 0; i < values.length; i++) {
+      const ids = this.providerIds(values[i]);
+      if (ids.length) return ids;
+    }
+
+    return [];
+  }
+
+  sourcePayload(result) {
+    if (!result || typeof result !== "object") {
+      return { sources: [], tracks: [], headers: {} };
+    }
+
+    const root = result;
+    const data = root.data && typeof root.data === "object" ? root.data : root;
+
+    let sources = Array.isArray(root.sources) ? root.sources : data.sources;
+    if (!Array.isArray(sources) && root.data && root.data.sources) {
+      sources = root.data.sources;
+    }
+    if (!Array.isArray(sources) && root.result && Array.isArray(root.result.sources)) {
+      sources = root.result.sources;
+    }
+    if (!Array.isArray(sources) && sources && Array.isArray(sources.items)) {
+      sources = sources.items;
+    }
+    if (!Array.isArray(sources) && typeof sources === "object") {
+      sources = Object.keys(sources).map(function (key) {
+        return sources[key];
+      });
+    }
+
+    let tracks = Array.isArray(root.tracks) ? root.tracks : data.tracks;
+    if (!Array.isArray(tracks) && root.data && root.data.tracks) {
+      tracks = root.data.tracks;
+    }
+    if (!Array.isArray(tracks) && root.result && Array.isArray(root.result.tracks)) {
+      tracks = root.result.tracks;
+    }
+    if (!Array.isArray(tracks) && data.subtitles) {
+      tracks = data.subtitles;
+    }
+
+    return {
+      sources: Array.isArray(sources) ? sources : [],
+      tracks: Array.isArray(tracks) ? tracks : [],
+      headers: root.headers || data.headers || {},
+    };
   }
 
   async findEpisodeServer(episode, server) {
@@ -188,7 +295,7 @@ class Provider {
       // Older API versions do not expose /servers; use the known IDs below.
     }
 
-    let providers = this.providerIds(type === "dub" ? servers.dubProviders : servers.subProviders);
+    let providers = this.serverProviders(servers, type);
     if (!providers.length) {
       providers = type === "dub"
         ? ["beep", "mimi", "vee", "yuki", "neko", "mochi", "uwu", "zuna", "loli", "sora"]
@@ -209,8 +316,9 @@ class Provider {
     for (let i = 0; i < providers.length; i++) {
       try {
         const result = await this.getSources(animeId, episodeNumber, type, providers[i]);
-        if (result && Array.isArray(result.sources) && result.sources.some(function (source) {
-          return source && source.url;
+        const payload = this.sourcePayload(result);
+        if (payload.sources.some(function (source) {
+          return source && (source.url || source.file || source.link);
         })) {
           data = result;
           usedProvider = providers[i];
@@ -225,25 +333,30 @@ class Provider {
       throw new Error("AnimeX returned no playable " + type.toUpperCase() + " sources for episode " + episodeNumber + ".");
     }
 
-    const videoSources = data.sources.filter(function (source) {
-      return source && source.url;
+    const responseData = this.sourcePayload(data);
+    const videoSources = responseData.sources.filter(function (source) {
+      return source && (source.url || source.file || source.link);
     }).map(function (source) {
-      const isHls = source.type === "video/mpegurl" || String(source.url).indexOf(".m3u8") !== -1;
+      const url = source.url || source.file || source.link;
+      const isHls = source.type === "video/mpegurl" || String(url).indexOf(".m3u8") !== -1 || source.format === "hls";
       return {
-        url: source.url,
-        quality: source.quality || "auto",
-        type: isHls ? "hls" : (source.type || "mp4"),
+        url: url,
+        quality: source.quality || source.qualityLabel || source.label || "auto",
+        type: isHls ? "hls" : (source.type || source.mimeType || "mp4"),
       };
     });
 
-    const subtitles = Array.isArray(data.tracks)
-      ? data.tracks.filter(function (track) {
-          return track && track.url && (track.kind === "captions" || track.kind === "subtitles");
+    const subtitles = Array.isArray(responseData.tracks)
+      ? responseData.tracks.filter(function (track) {
+          const url = track && (track.url || track.file || track.link);
+          const kind = String(track && (track.kind || track.type || "")).toLowerCase();
+          return url && (kind === "captions" || kind === "subtitles" || kind === "subtitle" || kind === "cc");
         }).map(function (track) {
+          const url = track.url || track.file || track.link;
           return {
-            url: track.url,
-            language: track.lang || "English",
-            label: track.label || track.lang || "English",
+            url: url,
+            language: track.lang || track.language || "English",
+            label: track.label || track.lang || track.language || "English",
             default: Boolean(track.default),
           };
         })
@@ -251,7 +364,7 @@ class Provider {
 
     return {
       server: usedProvider,
-      headers: data.headers || {},
+      headers: responseData.headers || {},
       videoSources: videoSources,
       subtitles: subtitles,
     };
