@@ -2,6 +2,7 @@ class Provider {
   constructor() {
     this.ANIMEX = "https://animex.one";
     this.API = "https://pp.animex.one";
+    this.GRAPHQL = "https://graphql.animex.one/graphql";
   }
 
   getSettings() { return {}; }
@@ -16,9 +17,6 @@ class Provider {
       .replace(/&quot;|&#x22;/gi, '"')
       .replace(/&lt;/gi, "<")
       .replace(/&gt;/gi, ">")
-      .replace(/&#(?:x([0-9a-f]+)|(\d+));/gi, function (_, hex, dec) {
-        return String.fromCharCode(parseInt(hex || dec, hex ? 16 : 10));
-      })
       .replace(/\s+/g, " ")
       .trim();
   }
@@ -26,68 +24,40 @@ class Provider {
   async getText(url) {
     const response = await fetch(url, {
       method: "GET",
-      headers: { Accept: "text/html,application/xhtml+xml" },
+      headers: {
+        Accept: "text/html,application/xhtml+xml",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
+      },
     });
     if (!response.ok) throw new Error("AnimeX request failed: HTTP " + response.status);
     return await response.text();
   }
 
-  async getJSON(url) {
-    const response = await fetch(url, {
+  async getJSON(url, options) {
+    const response = await fetch(url, Object.assign({
       method: "GET",
-      headers: { Accept: "application/json" },
-    });
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
+        Origin: this.ANIMEX,
+        Referer: this.ANIMEX + "/",
+      },
+    }, options || {}));
     if (!response.ok) throw new Error("AnimeX API request failed: HTTP " + response.status);
     return await response.json();
   }
 
-  extractSearchResults(html) {
-    const results = [];
-    const seen = {};
-    const add = (href, title, block) => {
-      if (!href) return;
-      href = String(href)
-        .replace(/&amp;/gi, "&")
-        .replace(/\\\//g, "/");
-      const match = href.match(/(?:https?:\/\/[^/]+)?\/anime\/([^/?#"'<>]+)/i);
-      if (!match) return;
-      const slug = decodeURIComponent(match[1]);
-      if (!slug || seen[slug]) return;
-
-      let cleanTitle = this.cleanText(title);
-      if (!cleanTitle && block) {
-        const titleMatch = String(block).match(/(?:title|data-title|alt)=['"]([^'"]+)['"]/i);
-        cleanTitle = titleMatch ? this.cleanText(titleMatch[1]) : this.cleanText(block);
-      }
-      if (!cleanTitle || /^(watch|play|episode|anime)$/i.test(cleanTitle)) return;
-
-      seen[slug] = true;
-      results.push({
-        id: slug,
-        title: cleanTitle,
-        url: this.ANIMEX + "/anime/" + slug,
-        subOrDub: "both",
-      });
-    };
-
-    // The catalog markup has changed several times. Do not require the
-    // title/image to have a particular position inside the anchor.
-    const anchorRegex = /<a\b([^>]*\bhref\s*=\s*["'][^"']+["'][^>]*)>([\s\S]*?)<\/a>/gi;
-    let match;
-    while ((match = anchorRegex.exec(html)) !== null) {
-      const attrs = match[1];
-      const block = match[2];
-      const hrefMatch = attrs.match(/\bhref\s*=\s*["']([^"']+)["']/i);
-      if (!hrefMatch) continue;
-      const titleMatch = attrs.match(/(?:title|data-title)=\s*["']([^"']+)["']/i);
-      const altMatch = block.match(/\balt\s*=\s*["']([^"']+)["']/i);
-      add(hrefMatch[1], titleMatch && titleMatch[1] || altMatch && altMatch[1] || block, block);
-    }
-
-    // Also support result data embedded by the client-side catalog.
-    const dataRegex = /["'](?:url|href)["']\s*:\s*["']((?:https?:\\?\/\\?\/[^"']+)?\\?\/anime\\?\/[^"']+)["'][\s\S]{0,500}?["'](?:title|name)["']\s*:\s*["']([^"']+)["']/gi;
-    while ((match = dataRegex.exec(html)) !== null) add(match[1], match[2], "");
-    return results;
+  async graphql(query, variables) {
+    return await this.getJSON(this.GRAPHQL, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Origin: this.ANIMEX,
+        Referer: this.ANIMEX + "/",
+      },
+      body: JSON.stringify({ query: query, variables: variables || {} }),
+    });
   }
 
   async search(input) {
@@ -97,36 +67,33 @@ class Provider {
     query = String(query).trim();
     if (!query) return [];
 
-    // Keep the existing endpoint first, then use the current search endpoint
-    // when AnimeX serves an empty catalog page for the legacy URL.
-    const paths = [
-      "/catalog?search=" + encodeURIComponent(query),
-      "/search?keyword=" + encodeURIComponent(query),
-      "/search?query=" + encodeURIComponent(query),
-    ];
-    for (let i = 0; i < paths.length; i++) {
-      try {
-        const results = this.extractSearchResults(await this.getText(this.ANIMEX + paths[i]));
-        if (results.length) return results;
-      } catch (error) {
-        // Try the next AnimeX search format.
+    // AnimeX moved catalog search to GraphQL. The old HTML endpoints return
+    // HTTP 200 with an empty application shell, which caused zero results.
+    const gql = "query FastSearch($query: String, $limit: Int, $includeAdult: Boolean) { catalogAnime(filter: { query: $query, includeAdult: $includeAdult }, limit: $limit) { items { id anilistId titleRomaji titleEnglish title { romaji english userPreferred } } } }";
+    try {
+      const response = await this.graphql(gql, {
+        query: query,
+        limit: 25,
+        includeAdult: false,
+      });
+      const items = response && response.data && response.data.catalogAnime && response.data.catalogAnime.items;
+      if (Array.isArray(items)) {
+        return items.filter(function (item) { return item && (item.id || item.anilistId); }).map(function (item) {
+          const titleObject = item.title || {};
+          const title = item.titleEnglish || titleObject.english || item.titleRomaji || titleObject.romaji || titleObject.userPreferred || String(item.id);
+          return {
+            id: String(item.id || item.anilistId),
+            title: title,
+            url: this.ANIMEX + "/anime/" + encodeURIComponent(String(item.id || item.anilistId)),
+            subOrDub: "both",
+          };
+        }, this);
       }
+    } catch (error) {
+      // Fall through for older AnimeX installations.
     }
-    return [];
-  }
 
-  findEpisodeCount(html) {
-    const patterns = [
-      /["']episodes["']\s*:\s*["']?(\d+)/i,
-      /["']episodeCount["']\s*:\s*["']?(\d+)/i,
-      /(\d+)\s+Episodes?/i,
-      /Episodes?[^0-9]{0,30}(\d+)/i,
-    ];
-    for (let i = 0; i < patterns.length; i++) {
-      const match = html.match(patterns[i]);
-      if (match && Number(match[1]) > 0) return Number(match[1]);
-    }
-    return 0;
+    return [];
   }
 
   async findEpisodes(id) {
@@ -134,29 +101,45 @@ class Provider {
     animeId = String(animeId || "");
     const pathMatch = animeId.match(/\/anime\/([^?#/]+)/i);
     if (pathMatch) animeId = pathMatch[1];
-    animeId = animeId.replace(/^\/+|\/+$/g, "");
+    animeId = decodeURIComponent(animeId.replace(/^\/+|\/+$/g, ""));
+
+    // Use the stable REST endpoint instead of guessing episode count from HTML.
+    try {
+      const data = await this.getJSON(this.API + "/rest/api/episodes?id=" + encodeURIComponent(animeId));
+      const list = Array.isArray(data) ? data : data && (data.episodes || data.results || data.data);
+      if (Array.isArray(list) && list.length) {
+        return list.map(function (item, index) {
+          const number = Number(item.number || item.episode || item.epNum || item.ep || index + 1);
+          return {
+            id: String(item.id || (animeId + "-episode-" + number)),
+            title: item.title || "Episode " + number,
+            number: number,
+            url: item.url || item.link || this.ANIMEX + "/watch/" + animeId + "-episode-" + number,
+          };
+        }, this);
+      }
+    } catch (error) {
+      // Use the page parser below when the REST endpoint is unavailable.
+    }
+
     const html = await this.getText(this.ANIMEX + "/anime/" + animeId);
-    let count = this.findEpisodeCount(html);
-    const escaped = animeId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const numbers = [];
-    const regex = new RegExp("/watch/" + escaped + "-episode-(\\d+)", "gi");
+    const regex = new RegExp("/watch/" + animeId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "-episode-(\\d+)", "gi");
     let match;
     while ((match = regex.exec(html)) !== null) {
       const number = Number(match[1]);
       if (numbers.indexOf(number) === -1) numbers.push(number);
     }
-    if (!count && numbers.length) count = Math.max.apply(null, numbers);
-    if (!count) throw new Error('AnimeX could not determine episode count for "' + animeId + '".');
-    const episodes = [];
-    for (let number = 1; number <= count; number++) {
-      episodes.push({
+    if (!numbers.length) throw new Error('AnimeX returned no episodes for "' + animeId + '".');
+    numbers.sort(function (a, b) { return a - b; });
+    return numbers.map(function (number) {
+      return {
         id: animeId + "-episode-" + number,
         title: "Episode " + number,
         number: number,
         url: this.ANIMEX + "/watch/" + animeId + "-episode-" + number,
-      });
-    }
-    return episodes;
+      };
+    }, this);
   }
 
   extractPlayerData(html) {
@@ -169,10 +152,9 @@ class Provider {
   }
 
   async getSources(id, episodeNumber, type, providerId) {
-    const url = this.API + "/rest/api/sources?id=" + encodeURIComponent(id) +
+    return await this.getJSON(this.API + "/rest/api/sources?id=" + encodeURIComponent(id) +
       "&epNum=" + encodeURIComponent(episodeNumber) + "&type=" + encodeURIComponent(type) +
-      "&providerId=" + encodeURIComponent(providerId);
-    return await this.getJSON(url);
+      "&providerId=" + encodeURIComponent(providerId));
   }
 
   normalizeServer(server) {
@@ -190,16 +172,16 @@ class Provider {
     const player = this.extractPlayerData(await this.getText(episodeUrl));
     let episodeNumber = player.episode || Number(item.number || 0);
     if (!episodeNumber) {
-      const numberMatch = String(item.id || "").match(/episode-(\d+)/i);
-      if (numberMatch) episodeNumber = Number(numberMatch[1]);
+      const match = String(item.id || "").match(/episode-(\d+)/i);
+      if (match) episodeNumber = Number(match[1]);
     }
     if (!episodeNumber) throw new Error("AnimeX episode number could not be determined.");
 
     const requested = this.normalizeServer(server);
     const type = requested.indexOf("dub") !== -1 ? "dub" : "sub";
-    let providers = type === "dub" ? ["yuki", "neko", "loli", "sora"] : ["beep", "yuki", "neko", "zuna", "loli", "sora"];
+    let providers = type === "dub" ? ["beep", "mimi", "vee", "yuki", "neko", "mochi", "uwu", "zuna", "loli", "sora"] : ["beep", "mimi", "vee", "mochi", "uwu", "yuki", "neko", "zuna", "loli", "sora"];
     const requestedProvider = requested.replace(/-(?:sub|dub)/g, "");
-    if (providers.indexOf(requestedProvider) !== -1) providers = [requestedProvider].concat(providers.filter(p => p !== requestedProvider));
+    if (providers.indexOf(requestedProvider) !== -1) providers = [requestedProvider].concat(providers.filter(function (p) { return p !== requestedProvider; }));
 
     let data = null;
     let usedProvider = null;
@@ -215,17 +197,12 @@ class Provider {
     }
     if (!data) throw new Error("AnimeX returned no playable " + type.toUpperCase() + " sources.");
 
-    const videoSources = data.sources.filter(s => s && s.url).map(s => ({
-      url: s.url,
-      quality: s.quality || "auto",
-      type: s.type === "video/mpegurl" || s.url.indexOf(".m3u8") !== -1 ? "hls" : (s.type || "hls"),
-    }));
-    const subtitles = Array.isArray(data.tracks) ? data.tracks.filter(t => t && t.url && (t.kind === "captions" || t.kind === "subtitles")).map(t => ({
-      url: t.url,
-      language: t.lang || "English",
-      label: t.label || t.lang || "English",
-      default: Boolean(t.default),
-    })) : [];
+    const videoSources = data.sources.filter(function (s) { return s && s.url; }).map(function (s) {
+      return { url: s.url, quality: s.quality || "auto", type: s.type === "video/mpegurl" || s.url.indexOf(".m3u8") !== -1 ? "hls" : (s.type || "hls") };
+    });
+    const subtitles = Array.isArray(data.tracks) ? data.tracks.filter(function (t) { return t && t.url && (t.kind === "captions" || t.kind === "subtitles"); }).map(function (t) {
+      return { url: t.url, language: t.lang || "English", label: t.label || t.lang || "English", default: Boolean(t.default) };
+    }) : [];
     return { server: usedProvider, headers: data.headers || {}, videoSources: videoSources, subtitles: subtitles };
   }
 }
