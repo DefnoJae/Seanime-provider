@@ -1,204 +1,220 @@
-/// <reference path="./online-streaming-provider.d.ts" />
+const BASE_URL = "https://aniwaves.ru";
+
+function decodeHtml(str = "") {
+    return str
+        .replace(/&amp;/g, "&")
+        .replace(/&#39;/g, "'")
+        .replace(/&quot;/g, '"')
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">");
+}
+
+function stripTags(str = "") {
+    return decodeHtml(str.replace(/<[^>]*>/g, "").trim());
+}
+
+function absoluteUrl(path = "") {
+    if (path.startsWith("http://") || path.startsWith("https://")) {
+        return path;
+    }
+
+    return BASE_URL + (path.startsWith("/") ? path : "/" + path);
+}
 
 class Provider {
-  constructor() {
-    this.anilist = "https://graphql.anilist.co";
-
-    // Backend URL referenced by Miruro's official repository.
-    this.api = "https://public-miruro-consumet-api.vercel.app";
-  }
-
-  getSettings() {
-    return {
-      episodeServers: ["SUB", "DUB"],
-      supportsDub: true,
-    };
-  }
-
-  async search(query) {
-    const searchQuery =
-      typeof query === "string"
-        ? query
-        : query?.query || query?.title || "";
-
-    if (!searchQuery.trim()) {
-      throw new Error("Search query is empty");
+    constructor() {
+        this.name = "Ani-Waves";
+        this.baseUrl = BASE_URL;
     }
 
-    const graphqlQuery = `
-      query ($search: String) {
-        Page(page: 1, perPage: 20) {
-          media(search: $search, type: ANIME) {
-            id
-            title {
-              romaji
-              english
+    async search(query) {
+        if (!query) return [];
+
+        const url =
+            `${BASE_URL}/filter?keyword=${encodeURIComponent(query)}`;
+
+        const response = await fetch(url, {
+            headers: {
+                Accept: "text/html,application/xhtml+xml"
             }
-          }
+        });
+
+        if (!response.ok) {
+            throw new Error(
+                `Ani-Waves search failed: HTTP ${response.status}`
+            );
         }
-      }
-    `;
 
-    const res = await fetch(this.anilist, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({
-        query: graphqlQuery,
-        variables: {
-          search: searchQuery.trim(),
-        },
-      }),
-    });
+        const html = await response.text();
 
-    if (!res.ok) {
-      throw new Error(
-        `AniList search failed: ${res.status} ${res.statusText}`
-      );
+        const results = [];
+        const seen = new Set();
+
+        /*
+         * Ani-Waves titles use URLs such as:
+         *
+         * /watch/naruto-76396
+         *
+         * We collect those links and extract their visible titles.
+         */
+        const regex =
+            /<a[^>]+href=["'](\/watch\/[^"'?#]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+
+        let match;
+
+        while ((match = regex.exec(html)) !== null) {
+            const path = match[1];
+
+            // Episode URLs are handled by findEpisodes().
+            if (/\/(?:episode|ep)\/?\d+/i.test(path)) {
+                continue;
+            }
+
+            const idMatch = path.match(/-(\d+)\/?$/);
+
+            if (!idMatch) continue;
+
+            const id = idMatch[1];
+
+            if (seen.has(id)) continue;
+
+            let title = "";
+
+            const titleMatch = match[2].match(
+                /class=["'][^"']*(?:d-title|title)[^"']*["'][^>]*>([\s\S]*?)<\//
+            );
+
+            if (titleMatch) {
+                title = stripTags(titleMatch[1]);
+            }
+
+            if (!title) {
+                const imgAlt = match[2].match(
+                    /<img[^>]+alt=["']([^"']+)["']/i
+                );
+
+                if (imgAlt) {
+                    title = decodeHtml(imgAlt[1].trim());
+                }
+            }
+
+            if (!title) continue;
+
+            seen.add(id);
+
+            results.push({
+                id: id,
+                title: title,
+                url: absoluteUrl(path),
+                subOrDub: "both"
+            });
+        }
+
+        return results;
     }
 
-    const data = await res.json();
+    async findEpisodes(id) {
+        if (!id) {
+            throw new Error("Ani-Waves anime ID is missing.");
+        }
 
-    if (data.errors?.length) {
-      throw new Error(
-        data.errors[0]?.message || "AniList search failed"
-      );
-    }
+        /*
+         * Seanime normally receives the ID returned by search().
+         *
+         * Ani-Waves' HTML tells us the series ID and episode count.
+         * For example Naruto uses ID 76396 and reports 220 episodes.
+         */
 
-    const media = data?.data?.Page?.media || [];
+        const searchUrl = `${BASE_URL}/watch/${id}`;
 
-    if (!media.length) {
-      throw new Error(`No anime found for "${searchQuery}"`);
-    }
+        let response = await fetch(searchUrl, {
+            headers: {
+                Accept: "text/html,application/xhtml+xml"
+            }
+        });
 
-    return media.map((anime) => ({
-      id: String(anime.id),
+        /*
+         * Some Ani-Waves pages require the slug as well as the numeric ID.
+         * If Seanime passed a complete /watch/... path, support that too.
+         */
+        if (!response.ok && String(id).includes("-")) {
+            response = await fetch(
+                `${BASE_URL}/watch/${id}`,
+                {
+                    headers: {
+                        Accept: "text/html,application/xhtml+xml"
+                    }
+                }
+            );
+        }
 
-      title:
-        anime.title?.english ||
-        anime.title?.romaji ||
-        `AniList ${anime.id}`,
+        if (!response.ok) {
+            throw new Error(
+                `Ani-Waves anime page failed: HTTP ${response.status}`
+            );
+        }
 
-      url: `https://anilist.co/anime/${anime.id}`,
+        const html = await response.text();
 
-      subOrDub: "sub",
-    }));
-  }
+        const canonical =
+            html.match(
+                /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i
+            ) ||
+            html.match(
+                /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i
+            );
 
-  async findEpisodes(id) {
-    const anilistId = String(id)
-      .replace("https://anilist.co/anime/", "")
-      .split("/")[0]
-      .trim();
+        let seriesUrl = canonical ? canonical[1] : response.url;
 
-    if (!anilistId || !/^\d+$/.test(anilistId)) {
-      throw new Error(`Invalid AniList ID received: ${id}`);
-    }
+        seriesUrl = seriesUrl
+            .replace(/\/episode\/\d+.*$/i, "")
+            .replace(/\/ep-\d+.*$/i, "");
 
-    /*
-      Miruro's frontend uses:
-
-      meta/anilist/episodes/{animeId}
-        ?provider=gogoanime
-        &dub=false
-    */
-
-    const url =
-      `${this.api}/meta/anilist/episodes/` +
-      `${encodeURIComponent(anilistId)}` +
-      `?provider=gogoanime&dub=false`;
-
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-      },
-    });
-
-    if (!res.ok) {
-      throw new Error(
-        `Miruro episode request failed: ${res.status} ${res.statusText}`
-      );
-    }
-
-    const data = await res.json();
-
-    /*
-      Be tolerant of a few possible response wrappers.
-    */
-    let rawEpisodes = [];
-
-    if (Array.isArray(data)) {
-      rawEpisodes = data;
-    } else if (Array.isArray(data?.episodes)) {
-      rawEpisodes = data.episodes;
-    } else if (Array.isArray(data?.results)) {
-      rawEpisodes = data.results;
-    } else if (Array.isArray(data?.data?.episodes)) {
-      rawEpisodes = data.data.episodes;
-    } else if (Array.isArray(data?.data)) {
-      rawEpisodes = data.data;
-    }
-
-    if (!rawEpisodes.length) {
-      throw new Error(
-        `Miruro returned no episodes for AniList ID ${anilistId}`
-      );
-    }
-
-    return rawEpisodes.map((ep, index) => {
-      const episodeNumber =
-        Number(
-          ep?.number ??
-          ep?.episodeNumber ??
-          ep?.episode ??
-          index + 1
-        ) || index + 1;
-
-      const episodeId =
-        ep?.id ??
-        ep?.episodeId ??
-        ep?.url;
-
-      if (!episodeId) {
-        throw new Error(
-          `Miruro episode ${episodeNumber} has no episode ID`
+        /*
+         * Ani-Waves exposes numberOfEpisodes in its JSON-LD.
+         */
+        const countMatch = html.match(
+            /"numberOfEpisodes"\s*:\s*(\d+)/i
         );
-      }
 
-      return {
-        id: String(episodeId),
+        if (!countMatch) {
+            throw new Error(
+                "Could not determine the Ani-Waves episode count."
+            );
+        }
 
-        title:
-          ep?.title ||
-          `Episode ${episodeNumber}`,
+        const episodeCount = Number(countMatch[1]);
 
-        number: episodeNumber,
+        const episodes = [];
 
-        url: String(episodeId),
+        for (let number = 1; number <= episodeCount; number++) {
+            const episodeUrl =
+                `${seriesUrl}/episode/${number}`;
 
-        thumbnail:
-          ep?.image ||
-          ep?.thumbnail ||
-          "",
-      };
-    });
-  }
+            episodes.push({
+                id: episodeUrl,
+                title: `Episode ${number}`,
+                number: number,
+                url: episodeUrl
+            });
+        }
 
-  async findEpisodeServer(episode, server) {
-    /*
-      Diagnostic stage.
+        return episodes;
+    }
 
-      If we reach this function, then:
-        Seanime -> AniList -> Miruro -> episode list
+    async findEpisodeServer(episode, server) {
+        /*
+         * Ani-Waves loads #w-servers dynamically with JavaScript.
+         *
+         * We have intentionally NOT guessed the private request used here.
+         * Once the Ani-Waves main.js request format is known, source
+         * resolution goes in this method.
+         */
 
-      is working.
-    */
-
-    throw new Error(
-      `Miruro episode list works. Reached ${server} stream resolver for episode ${episode?.number || "?"}.`
-    );
-  }
+        throw new Error(
+            "Ani-Waves source resolution is not implemented yet."
+        );
+    }
 }
+
+module.exports = Provider;
