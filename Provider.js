@@ -1,220 +1,387 @@
-const BASE_URL = "https://aniwaves.ru";
+const ANIMEX = "https://animex.one";
+const API = "https://pp.animex.one";
 
-function decodeHtml(str = "") {
-    return str
-        .replace(/&amp;/g, "&")
-        .replace(/&#39;/g, "'")
-        .replace(/&quot;/g, '"')
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">");
+function cleanText(value = "") {
+  return value
+    .replace(/<[^>]*>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function stripTags(str = "") {
-    return decodeHtml(str.replace(/<[^>]*>/g, "").trim());
+async function getText(url) {
+  const response = await fetch(url, {
+    headers: {
+      Accept: "text/html,application/xhtml+xml",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`AnimeX request failed: HTTP ${response.status}`);
+  }
+
+  return response.text();
 }
 
-function absoluteUrl(path = "") {
-    if (path.startsWith("http://") || path.startsWith("https://")) {
-        return path;
-    }
+async function getJSON(url) {
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+    },
+  });
 
-    return BASE_URL + (path.startsWith("/") ? path : "/" + path);
+  if (!response.ok) {
+    throw new Error(`AnimeX API request failed: HTTP ${response.status}`);
+  }
+
+  return response.json();
 }
 
-class Provider {
-    constructor() {
-        this.name = "Ani-Waves";
-        this.baseUrl = BASE_URL;
+function getAnimeLinks(html) {
+  const results = [];
+  const seen = new Set();
+
+  const regex =
+    /<a[^>]+href=["'](?:https?:\/\/animex\.one)?\/anime\/([^"'?#]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+
+  let match;
+
+  while ((match = regex.exec(html)) !== null) {
+    const slug = match[1];
+
+    if (!slug || seen.has(slug)) {
+      continue;
     }
 
-    async search(query) {
-        if (!query) return [];
+    const block = match[2];
 
-        const url =
-            `${BASE_URL}/filter?keyword=${encodeURIComponent(query)}`;
+    let title = "";
 
-        const response = await fetch(url, {
-            headers: {
-                Accept: "text/html,application/xhtml+xml"
-            }
-        });
+    const imgAlt = block.match(/alt=["']([^"']+)["']/i);
 
-        if (!response.ok) {
-            throw new Error(
-                `Ani-Waves search failed: HTTP ${response.status}`
-            );
-        }
-
-        const html = await response.text();
-
-        const results = [];
-        const seen = new Set();
-
-        /*
-         * Ani-Waves titles use URLs such as:
-         *
-         * /watch/naruto-76396
-         *
-         * We collect those links and extract their visible titles.
-         */
-        const regex =
-            /<a[^>]+href=["'](\/watch\/[^"'?#]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-
-        let match;
-
-        while ((match = regex.exec(html)) !== null) {
-            const path = match[1];
-
-            // Episode URLs are handled by findEpisodes().
-            if (/\/(?:episode|ep)\/?\d+/i.test(path)) {
-                continue;
-            }
-
-            const idMatch = path.match(/-(\d+)\/?$/);
-
-            if (!idMatch) continue;
-
-            const id = idMatch[1];
-
-            if (seen.has(id)) continue;
-
-            let title = "";
-
-            const titleMatch = match[2].match(
-                /class=["'][^"']*(?:d-title|title)[^"']*["'][^>]*>([\s\S]*?)<\//
-            );
-
-            if (titleMatch) {
-                title = stripTags(titleMatch[1]);
-            }
-
-            if (!title) {
-                const imgAlt = match[2].match(
-                    /<img[^>]+alt=["']([^"']+)["']/i
-                );
-
-                if (imgAlt) {
-                    title = decodeHtml(imgAlt[1].trim());
-                }
-            }
-
-            if (!title) continue;
-
-            seen.add(id);
-
-            results.push({
-                id: id,
-                title: title,
-                url: absoluteUrl(path),
-                subOrDub: "both"
-            });
-        }
-
-        return results;
+    if (imgAlt) {
+      title = cleanText(imgAlt[1]);
     }
 
-    async findEpisodes(id) {
-        if (!id) {
-            throw new Error("Ani-Waves anime ID is missing.");
-        }
-
-        /*
-         * Seanime normally receives the ID returned by search().
-         *
-         * Ani-Waves' HTML tells us the series ID and episode count.
-         * For example Naruto uses ID 76396 and reports 220 episodes.
-         */
-
-        const searchUrl = `${BASE_URL}/watch/${id}`;
-
-        let response = await fetch(searchUrl, {
-            headers: {
-                Accept: "text/html,application/xhtml+xml"
-            }
-        });
-
-        /*
-         * Some Ani-Waves pages require the slug as well as the numeric ID.
-         * If Seanime passed a complete /watch/... path, support that too.
-         */
-        if (!response.ok && String(id).includes("-")) {
-            response = await fetch(
-                `${BASE_URL}/watch/${id}`,
-                {
-                    headers: {
-                        Accept: "text/html,application/xhtml+xml"
-                    }
-                }
-            );
-        }
-
-        if (!response.ok) {
-            throw new Error(
-                `Ani-Waves anime page failed: HTTP ${response.status}`
-            );
-        }
-
-        const html = await response.text();
-
-        const canonical =
-            html.match(
-                /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i
-            ) ||
-            html.match(
-                /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i
-            );
-
-        let seriesUrl = canonical ? canonical[1] : response.url;
-
-        seriesUrl = seriesUrl
-            .replace(/\/episode\/\d+.*$/i, "")
-            .replace(/\/ep-\d+.*$/i, "");
-
-        /*
-         * Ani-Waves exposes numberOfEpisodes in its JSON-LD.
-         */
-        const countMatch = html.match(
-            /"numberOfEpisodes"\s*:\s*(\d+)/i
-        );
-
-        if (!countMatch) {
-            throw new Error(
-                "Could not determine the Ani-Waves episode count."
-            );
-        }
-
-        const episodeCount = Number(countMatch[1]);
-
-        const episodes = [];
-
-        for (let number = 1; number <= episodeCount; number++) {
-            const episodeUrl =
-                `${seriesUrl}/episode/${number}`;
-
-            episodes.push({
-                id: episodeUrl,
-                title: `Episode ${number}`,
-                number: number,
-                url: episodeUrl
-            });
-        }
-
-        return episodes;
+    if (!title) {
+      title = cleanText(block);
     }
 
-    async findEpisodeServer(episode, server) {
-        /*
-         * Ani-Waves loads #w-servers dynamically with JavaScript.
-         *
-         * We have intentionally NOT guessed the private request used here.
-         * Once the Ani-Waves main.js request format is known, source
-         * resolution goes in this method.
-         */
-
-        throw new Error(
-            "Ani-Waves source resolution is not implemented yet."
-        );
+    if (!title) {
+      continue;
     }
+
+    seen.add(slug);
+
+    results.push({
+      id: slug,
+      title,
+      url: `${ANIMEX}/anime/${slug}`,
+      subOrDub: "both",
+    });
+  }
+
+  return results;
 }
 
-module.exports = Provider;
+async function search(query) {
+  if (!query || !query.trim()) {
+    return [];
+  }
+
+  const url =
+    `${ANIMEX}/catalog?search=${encodeURIComponent(query.trim())}`;
+
+  const html = await getText(url);
+
+  return getAnimeLinks(html);
+}
+
+function findEpisodeCount(html) {
+  const patterns = [
+    /["']episodes["']\s*:\s*(\d+)/i,
+    /(\d+)\s+Episodes?/i,
+    /Episodes?[^0-9]{0,30}(\d+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+
+    if (match) {
+      const count = Number(match[1]);
+
+      if (Number.isFinite(count) && count > 0) {
+        return count;
+      }
+    }
+  }
+
+  return 0;
+}
+
+async function findEpisodes(id) {
+  const animeUrl = `${ANIMEX}/anime/${id}`;
+  const html = await getText(animeUrl);
+
+  let episodeCount = findEpisodeCount(html);
+
+  /*
+   * Fallback:
+   * look for episode links already present in the page.
+   */
+  const episodeNumbers = new Set();
+
+  const episodeRegex =
+    new RegExp(
+      `/watch/${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-episode-(\\d+)`,
+      "gi"
+    );
+
+  let match;
+
+  while ((match = episodeRegex.exec(html)) !== null) {
+    episodeNumbers.add(Number(match[1]));
+  }
+
+  if (!episodeCount && episodeNumbers.size) {
+    episodeCount = Math.max(...episodeNumbers);
+  }
+
+  if (!episodeCount) {
+    throw new Error(
+      `AnimeX could not determine the episode count for "${id}".`
+    );
+  }
+
+  const episodes = [];
+
+  for (let number = 1; number <= episodeCount; number++) {
+    episodes.push({
+      id: `${id}-episode-${number}`,
+      title: `Episode ${number}`,
+      number,
+      url: `${ANIMEX}/watch/${id}-episode-${number}`,
+    });
+  }
+
+  return episodes;
+}
+
+function extractPlayerData(html) {
+  /*
+   * AnimeX embeds its player using:
+   *
+   * https://plyr.animex.one/e/<internal-id>/<episode>
+   */
+
+  const patterns = [
+    /https?:\/\/plyr\.animex\.one\/e\/([^/"'?]+)\/(\d+)/i,
+    /\/\/plyr\.animex\.one\/e\/([^/"'?]+)\/(\d+)/i,
+    /plyr\.animex\.one\\?\/e\\?\/([^\\/"'?]+)\\?\/(\d+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+
+    if (match) {
+      return {
+        id: match[1],
+        episode: Number(match[2]),
+      };
+    }
+  }
+
+  /*
+   * Fallback for AnimeX's serialized page data.
+   */
+  const accessId =
+    html.match(/["']access_id["']\s*:\s*["']([^"']+)["']/i) ||
+    html.match(/access_id\\?["']?\s*:\s*\\?["']([^"'\\]+)["']/i);
+
+  if (accessId) {
+    return {
+      id: accessId[1],
+      episode: null,
+    };
+  }
+
+  throw new Error("AnimeX player ID could not be found.");
+}
+
+async function getSources(id, episode, type, provider) {
+  const url =
+    `${API}/rest/api/sources` +
+    `?id=${encodeURIComponent(id)}` +
+    `&epNum=${encodeURIComponent(episode)}` +
+    `&type=${encodeURIComponent(type)}` +
+    `&providerId=${encodeURIComponent(provider)}`;
+
+  return getJSON(url);
+}
+
+function normalizeServer(server) {
+  if (!server) {
+    return null;
+  }
+
+  if (typeof server === "string") {
+    return server.toLowerCase();
+  }
+
+  if (server.id) {
+    return String(server.id).toLowerCase();
+  }
+
+  if (server.name) {
+    return String(server.name).toLowerCase();
+  }
+
+  return null;
+}
+
+async function findEpisodeServer(episode, server) {
+  const html = await getText(episode.url);
+
+  const player = extractPlayerData(html);
+
+  const episodeNumber =
+    player.episode ||
+    Number(episode.number) ||
+    Number(String(episode.id).match(/episode-(\d+)/i)?.[1]);
+
+  if (!episodeNumber) {
+    throw new Error("AnimeX episode number could not be determined.");
+  }
+
+  /*
+   * AnimeX providers discovered from its player:
+   *
+   * SUB:
+   * beep, yuki, neko, zuna, loli, sora
+   *
+   * DUB:
+   * yuki, neko, loli, sora
+   */
+
+  const requestedServer = normalizeServer(server);
+
+  let type = "sub";
+
+  if (
+    requestedServer &&
+    (requestedServer.includes("dub") ||
+      requestedServer === "yuki-dub" ||
+      requestedServer === "neko-dub" ||
+      requestedServer === "loli-dub" ||
+      requestedServer === "sora-dub")
+  ) {
+    type = "dub";
+  }
+
+  let provider = requestedServer;
+
+  if (provider) {
+    provider = provider
+      .replace("-sub", "")
+      .replace("-dub", "");
+  }
+
+  const subProviders = [
+    "beep",
+    "yuki",
+    "neko",
+    "zuna",
+    "loli",
+    "sora",
+  ];
+
+  const dubProviders = [
+    "yuki",
+    "neko",
+    "loli",
+    "sora",
+  ];
+
+  const providers =
+    type === "dub" ? dubProviders : subProviders;
+
+  if (provider && providers.includes(provider)) {
+    providers.splice(providers.indexOf(provider), 1);
+    providers.unshift(provider);
+  }
+
+  let data = null;
+  let usedProvider = null;
+
+  /*
+   * Same basic behavior as the AnimeX player:
+   * try providers until one returns a playable source.
+   */
+  for (const providerId of providers) {
+    try {
+      const result = await getSources(
+        player.id,
+        episodeNumber,
+        type,
+        providerId
+      );
+
+      if (
+        result &&
+        Array.isArray(result.sources) &&
+        result.sources.length > 0
+      ) {
+        data = result;
+        usedProvider = providerId;
+        break;
+      }
+    } catch (_) {
+      // Try the next AnimeX provider.
+    }
+  }
+
+  if (!data) {
+    throw new Error(
+      `AnimeX returned no playable ${type.toUpperCase()} sources.`
+    );
+  }
+
+  const headers = data.headers || {};
+
+  const videoSources = data.sources.map((source) => ({
+    url: source.url,
+    quality: source.quality || "auto",
+    type:
+      source.type === "video/mpegurl" ||
+      source.url.includes(".m3u8")
+        ? "hls"
+        : source.type || "hls",
+  }));
+
+  const subtitles = Array.isArray(data.tracks)
+    ? data.tracks
+        .filter(
+          (track) =>
+            track.url &&
+            (track.kind === "captions" ||
+              track.kind === "subtitles")
+        )
+        .map((track) => ({
+          url: track.url,
+          language: track.lang || "English",
+          label: track.label || track.lang || "English",
+          default: Boolean(track.default),
+        }))
+    : [];
+
+  return {
+    server: usedProvider,
+    headers,
+    videoSources,
+    subtitles,
+  };
+}
