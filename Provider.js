@@ -259,6 +259,42 @@ class Provider {
     };
   }
 
+  async getSignsAndSongsSubtitles(animeId, episodeNumber, existingResult) {
+    try {
+      // AnimeX's neko dub response exposes the forced English track used for
+      // translated signs and songs. It is independent of the selected video source.
+      const result = existingResult || await this.getSources(animeId, episodeNumber, "dub", "neko");
+      const tracks = this.sourcePayload(result).tracks;
+
+      for (let i = 0; i < tracks.length; i++) {
+        const track = tracks[i];
+        if (!track || typeof track !== "object") continue;
+
+        const label = String(track.label || track.language || track.lang || track.srclang || "")
+          .toLowerCase()
+          .trim();
+        const kind = String(track.kind || "").toLowerCase().trim();
+        const isEnglish = label === "english" || label === "eng" || label === "en" ||
+          label.indexOf("english (") === 0;
+        const isCaption = !kind || kind === "captions" || kind === "subtitles";
+        const url = String(track.file || track.url || track.src || "").trim();
+
+        if (isEnglish && isCaption && /^https?:\/\/\S+\.vtt(?:[?#]\S*)?$/i.test(url)) {
+          return [{
+            id: "signs-songs-en",
+            url: url,
+            language: "en",
+            isDefault: true,
+          }];
+        }
+      }
+    } catch (error) {
+      // Subtitle augmentation is best-effort and must never block playback.
+    }
+
+    return [];
+  }
+
   async findEpisodeServer(episode, server) {
     const item = episode && typeof episode === "object"
       ? episode
@@ -337,16 +373,27 @@ class Provider {
     }
 
     const responseData = this.sourcePayload(data);
+    const signsAndSongsSubtitles = type === "dub"
+      ? await this.getSignsAndSongsSubtitles(
+        animeId,
+        episodeNumber,
+        usedProvider === "neko" ? data : null
+      )
+      : [];
     const videoSources = responseData.sources.filter(function (source) {
       return source && (source.url || source.file || source.link);
     }).map(function (source) {
       const url = source.url || source.file || source.link;
       const isHls = source.type === "video/mpegurl" || String(url).indexOf(".m3u8") !== -1 || source.format === "hls";
-      return {
+      const videoSource = {
         url: url,
         quality: source.quality || source.qualityLabel || source.label || "auto",
         type: isHls ? "m3u8" : (source.type || source.mimeType || "mp4"),
       };
+      if (signsAndSongsSubtitles.length) {
+        videoSource.subtitles = signsAndSongsSubtitles;
+      }
+      return videoSource;
     });
 
     return {
