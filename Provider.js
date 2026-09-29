@@ -504,9 +504,12 @@ class Provider {
     if (usedProvider === "zuna" && videoSources.some(function (source) {
       return String(source && source.url || "").toLowerCase().indexOf("hls.1embed.buzz") !== -1;
     })) {
-      // hls.1embed.buzz is referer-gated. Seanime's HLS proxy forwards these
-      // EpisodeServer headers to the master playlist, variants, and segments.
+      // Zuna's HLS host expects the same request context used by its player.
+      // Forward both Referer and Origin to the master playlist, variants, and
+      // segments; sending only Referer can make 1embed stall or retry slowly.
       playbackHeaders.Referer = "https://zokoanime.video/";
+      playbackHeaders.Origin = "https://zokoanime.video";
+      playbackHeaders.Accept = "*/*";
       if (!playbackHeaders["User-Agent"]) playbackHeaders["User-Agent"] = this.UA;
     }
 
