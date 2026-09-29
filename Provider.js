@@ -335,11 +335,17 @@ class Provider {
     }
 
     let providers = this.serverProviders(servers, type);
-    if (!providers.length) {
-      providers = type === "dub"
-        ? ["yuki", "neko"]
-        : ["beep", "yuki"];
-    }
+
+    // AnimeX can report only a subset of providers for an episode even when
+    // another backend still has a playable source. Keep API-reported providers
+    // first, then append known fallbacks so Sub and Dub stay resilient.
+    const fallbackProviders = type === "dub"
+      ? ["yuki", "neko", "sora", "koto", "anmx"]
+      : ["beep", "yuki", "sora", "koto", "anmx"];
+
+    providers = providers.concat(fallbackProviders).filter(function (id, index, array) {
+      return id && array.indexOf(id) === index;
+    });
 
     const requestedProvider = requested
       .replace(/-(?:sub|dub)/g, "")
@@ -354,6 +360,10 @@ class Provider {
     let usedProvider = null;
     for (let i = 0; i < providers.length; i++) {
       try {
+        console.log(
+          "[AnimeX] Trying " + type + " provider=" + providers[i] +
+          " episode=" + episodeNumber
+        );
         const result = await this.getSources(animeId, episodeNumber, type, providers[i]);
         const payload = this.sourcePayload(result);
         if (payload.sources.some(function (source) {
@@ -363,8 +373,16 @@ class Provider {
           usedProvider = providers[i];
           break;
         }
+        console.log(
+          "[AnimeX] " + providers[i] + " returned no playable " + type +
+          " source for episode " + episodeNumber
+        );
       } catch (error) {
-        // Try the next provider returned by AnimeX.
+        console.log(
+          "[AnimeX] " + providers[i] + " failed for " + type +
+          " episode=" + episodeNumber + ": " + String(error && error.message || error)
+        );
+        // Try the next provider.
       }
     }
 
