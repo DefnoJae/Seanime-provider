@@ -143,12 +143,31 @@ class Provider {
   }
 
   async getSources(id, episodeNumber, type, providerId) {
-    return await this.getJSON(
-      this.API + "/rest/api/sources?id=" + encodeURIComponent(id) +
+    const url = this.API + "/rest/api/sources?id=" + encodeURIComponent(id) +
       "&epNum=" + encodeURIComponent(episodeNumber) +
       "&type=" + encodeURIComponent(type) +
-      "&providerId=" + encodeURIComponent(providerId)
-    );
+      "&providerId=" + encodeURIComponent(providerId);
+
+    const maxAttempts = providerId === "yuki" && type === "dub" ? 2 : 1;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.getJSON(url);
+      } catch (error) {
+        lastError = error;
+        const message = String(error && error.message || error);
+        const transient = /HTTP\s+(502|503|504)\b/.test(message);
+        if (!transient || attempt >= maxAttempts) throw error;
+
+        console.log(
+          "[AnimeX] Retrying Yuki dub after transient failure" +
+          " attempt=" + attempt + " episode=" + episodeNumber
+        );
+      }
+    }
+
+    throw lastError || new Error("AnimeX source request failed.");
   }
 
   normalizeServer(server) {
@@ -367,27 +386,38 @@ class Provider {
     }
 
     const discoveredProviders = this.serverProviders(servers, type);
+    const primaryProvider = type === "dub" ? "yuki" : "zuna";
+    const fallbackOrder = type === "dub"
+      ? ["mimi", "uwu", "kiwi", "miku", "neko", "shiro"]
+      : ["beep", "mimi", "kiwi", "uwu", "miku", "mochi", "vee", "neko", "shiro", "yuki"];
 
-    const preferredProviders = type === "dub"
-      ? ["mimi", "uwu", "kiwi", "miku", "zuna", "mochi", "vee", "neko", "shiro", "yuki", "sora"]
-      : ["zuna", "beep", "mimi", "kiwi", "uwu", "miku", "mochi", "vee", "neko", "shiro", "yuki", "sora"];
+    let providers = [];
 
-    // If AnimeX reports providers for this exact audio type, use only those
-    // providers and sort them by preference. This avoids probing stale IDs.
-    let providers = discoveredProviders.length
-      ? discoveredProviders.slice()
-      : preferredProviders.slice();
+    // Match the player behavior deliberately:
+    //   SUB -> Zuna
+    //   DUB -> Yuki
+    // If that primary provider is advertised for the episode, do not expose
+    // other AnimeX backends as competing servers for the same audio mode.
+    if (discoveredProviders.indexOf(primaryProvider) !== -1) {
+      providers = [primaryProvider];
+    } else if (discoveredProviders.length) {
+      providers = discoveredProviders.slice().sort(function (a, b) {
+        const ai = fallbackOrder.indexOf(a);
+        const bi = fallbackOrder.indexOf(b);
+        if (ai === -1 && bi === -1) return 0;
+        if (ai === -1) return 1;
+        if (bi === -1) return -1;
+        return ai - bi;
+      });
+    } else {
+      providers = [primaryProvider].concat(fallbackOrder);
+    }
 
-    providers.sort(function (a, b) {
-      const ai = preferredProviders.indexOf(a);
-      const bi = preferredProviders.indexOf(b);
-      if (ai === -1 && bi === -1) return 0;
-      if (ai === -1) return 1;
-      if (bi === -1) return -1;
-      return ai - bi;
-    });
-
-    console.log("[AnimeX] " + type + " providers=" + providers.join(","));
+    console.log(
+      "[AnimeX] mode=" + type +
+      " primary=" + primaryProvider +
+      " providers=" + providers.join(",")
+    );
 
     const requestedProvider = requested
       .replace(/-(?:sub|dub)/g, "")
@@ -470,9 +500,19 @@ class Provider {
       return videoSource;
     });
 
+    const playbackHeaders = Object.assign({}, responseData.headers || {});
+    if (usedProvider === "zuna" && videoSources.some(function (source) {
+      return String(source && source.url || "").toLowerCase().indexOf("hls.1embed.buzz") !== -1;
+    })) {
+      // hls.1embed.buzz is referer-gated. Seanime's HLS proxy forwards these
+      // EpisodeServer headers to the master playlist, variants, and segments.
+      playbackHeaders.Referer = "https://zokoanime.video/";
+      if (!playbackHeaders["User-Agent"]) playbackHeaders["User-Agent"] = this.UA;
+    }
+
     return {
       server: usedProvider,
-      headers: responseData.headers || {},
+      headers: playbackHeaders,
       videoSources: videoSources,
     };
   }
