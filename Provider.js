@@ -4,6 +4,20 @@ class Provider {
     this.API = "https://pp.animex.one";
     this.GRAPHQL = "https://graphql.animex.one/graphql";
     this.UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36";
+    this.SERVER_TIMEOUT_MS = 3000;
+    this.SOURCE_TIMEOUT_MS = 4000;
+    this.PROBE_TIMEOUT_MS = 3000;
+    this.SELECTION_TIMEOUT_MS = 12000;
+    // Seanime constructs a Provider for each call but reuses the VM/class.
+    if (!Provider.healthCache) Provider.healthCache = Object.create(null);
+    this.healthCache = Provider.healthCache;
+    Object.keys(this.healthCache).forEach(function (key) {
+      if (this.healthCache[key].expires <= Date.now()) delete this.healthCache[key];
+    }, this);
+    if (Object.keys(this.healthCache).length > 100) {
+      Provider.healthCache = Object.create(null);
+      this.healthCache = Provider.healthCache;
+    }
   }
 
   getSettings() {
@@ -22,10 +36,10 @@ class Provider {
       Referer: this.ANIMEX + "/",
     }, config.headers || {});
 
-    const response = await fetch(url, Object.assign({}, config, {
+    const response = await this.fetchBefore(url, Object.assign({}, config, {
       method: config.method || "GET",
       headers: headers,
-    }));
+    }), config.deadline || Date.now() + 10000);
 
     if (!response.ok) {
       throw new Error("AnimeX API request failed: HTTP " + response.status);
@@ -36,6 +50,26 @@ class Provider {
       throw new Error("AnimeX GraphQL request failed: " + (json.errors[0].message || "unknown error"));
     }
     return json;
+  }
+
+  async fetchBefore(url, options, deadline) {
+    // Seanime's documented timeout is in whole SECONDS. Affected host builds
+    // ignore JS numbers (Go int/int64 mismatch); see docs/validation.md and the
+    // companion host patch. On those builds an in-flight request can take 35s.
+    // The elapsed checks still prevent starting more work after the budget.
+    const timeout = Math.floor((deadline - Date.now()) / 1000);
+    if (timeout < 1) throw new Error("Request time budget exhausted");
+    const config = Object.assign({}, options || {}, { timeout: timeout });
+    delete config.deadline;
+    let response;
+    try {
+      response = await fetch(url, config);
+    } catch (error) {
+      // Native errors can contain signed URLs. Keep logs token-free.
+      throw new Error("Network request failed or timed out");
+    }
+    if (Date.now() >= deadline) throw new Error("Request time budget exhausted");
+    return response;
   }
 
   async graphql(query, variables) {
@@ -134,15 +168,16 @@ class Provider {
     }, this);
   }
 
-  async getServers(animeId, episodeNumber) {
+  async getServers(animeId, episodeNumber, deadline) {
     const data = await this.getJSON(
       this.API + "/rest/api/servers?id=" + encodeURIComponent(animeId) +
-      "&epNum=" + encodeURIComponent(episodeNumber)
+      "&epNum=" + encodeURIComponent(episodeNumber),
+      { deadline: deadline || Date.now() + this.SERVER_TIMEOUT_MS }
     );
     return data || {};
   }
 
-  async getSources(id, episodeNumber, type, providerId) {
+  async getSources(id, episodeNumber, type, providerId, deadline) {
     const url = this.API + "/rest/api/sources?id=" + encodeURIComponent(id) +
       "&epNum=" + encodeURIComponent(episodeNumber) +
       "&type=" + encodeURIComponent(type) +
@@ -150,10 +185,11 @@ class Provider {
 
     const maxAttempts = providerId === "yuki" && type === "dub" ? 2 : 1;
     let lastError = null;
+    const expires = deadline || Date.now() + this.SOURCE_TIMEOUT_MS;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        return await this.getJSON(url);
+        return await this.getJSON(url, { deadline: expires });
       } catch (error) {
         lastError = error;
         const message = String(error && error.message || error);
@@ -213,119 +249,289 @@ class Provider {
     }, this).filter(Boolean);
   }
 
-  serverProviders(servers, type) {
-    if (!servers || typeof servers !== "object") return [];
-
-    const matchKeys = [type + "Providers", type + "Provider", type + "s", type, "providers", "servers", "data"];
-    for (let i = 0; i < matchKeys.length; i++) {
-      const key = matchKeys[i];
-      const value = servers[key];
-      if (value !== undefined) {
-        const ids = this.providerIds(value);
+  serverProviders(servers, type, depth) {
+    // Only a list explicitly scoped to this audio mode is authoritative.
+    // In particular, [] must not fall through into the opposite mode's list.
+    if (!servers || typeof servers !== "object" || (depth || 0) > 4) return [];
+    const keys = Object.keys(servers);
+    const modeKeys = [type + "providers", type + "provider", type + "s", type];
+    for (let i = 0; i < modeKeys.length; i++) {
+      for (let j = 0; j < keys.length; j++) {
+        if (keys[j].toLowerCase() === modeKeys[i]) return this.providerIds(servers[keys[j]]);
+      }
+    }
+    const wrappers = ["data", "result", "servers", "providers"];
+    for (let i = 0; i < wrappers.length; i++) {
+      if (servers[wrappers[i]] && typeof servers[wrappers[i]] === "object") {
+        const ids = this.serverProviders(servers[wrappers[i]], type, (depth || 0) + 1);
         if (ids.length) return ids;
       }
     }
-
-    const candidateKeys = Object.keys(servers);
-    for (let i = 0; i < candidateKeys.length; i++) {
-      const key = candidateKeys[i].toLowerCase();
-      if (key === type || key === type + "providers" || key === type + "provider" || key === type + "s") {
-        const ids = this.providerIds(servers[candidateKeys[i]]);
-        if (ids.length) return ids;
-      }
-    }
-
-    const values = Object.keys(servers).reduce(function (result, key) {
-      const value = servers[key];
-      if (value && typeof value === "object") {
-        result.push(value);
-      }
-      return result;
-    }, []);
-    for (let i = 0; i < values.length; i++) {
-      const ids = this.providerIds(values[i]);
-      if (ids.length) return ids;
-    }
-
     return [];
+  }
+
+  orderProviders(discovered, type) {
+    const preferred = type === "dub" ? ["yuki"] : ["zuna", "yuki"];
+    return preferred.filter(function (id) { return discovered.indexOf(id) !== -1; })
+      .concat(discovered.filter(function (id) { return preferred.indexOf(id) === -1; }));
   }
 
   sourcePayload(result) {
-    if (!result || typeof result !== "object") {
-      return { sources: [], tracks: [], headers: {} };
+    if (!result || typeof result !== "object") return { sources: [], tracks: [], headers: {} };
+    const containers = [result, result.data, result.result].filter(function (value) {
+      return value && typeof value === "object";
+    });
+    let sources = [];
+    let tracks = [];
+    let headers = {};
+    for (let i = 0; i < containers.length; i++) {
+      const value = containers[i];
+      let list = value.sources;
+      if (list && Array.isArray(list.items)) list = list.items;
+      if (list && typeof list === "object" && !Array.isArray(list)) {
+        list = Object.keys(list).map(function (key) { return list[key]; });
+      }
+      if (!sources.length && Array.isArray(list)) sources = list;
+      if (Array.isArray(value.tracks)) tracks = tracks.concat(value.tracks);
+      if (Array.isArray(value.subtitles)) tracks = tracks.concat(value.subtitles);
+      if (value.headers && typeof value.headers === "object") headers = Object.assign({}, value.headers, headers);
     }
-
-    const root = result;
-    const data = root.data && typeof root.data === "object" ? root.data : root;
-
-    let sources = Array.isArray(root.sources) ? root.sources : data.sources;
-    if (!Array.isArray(sources) && root.data && root.data.sources) {
-      sources = root.data.sources;
-    }
-    if (!Array.isArray(sources) && root.result && Array.isArray(root.result.sources)) {
-      sources = root.result.sources;
-    }
-    if (!Array.isArray(sources) && sources && Array.isArray(sources.items)) {
-      sources = sources.items;
-    }
-    if (!Array.isArray(sources) && typeof sources === "object") {
-      sources = Object.keys(sources).map(function (key) {
-        return sources[key];
-      });
-    }
-
-    let tracks = Array.isArray(root.tracks) ? root.tracks : data.tracks;
-    if (!Array.isArray(tracks) && root.data && root.data.tracks) {
-      tracks = root.data.tracks;
-    }
-    if (!Array.isArray(tracks) && root.result && Array.isArray(root.result.tracks)) {
-      tracks = root.result.tracks;
-    }
-    if (!Array.isArray(tracks) && data.subtitles) {
-      tracks = data.subtitles;
-    }
-
-    return {
-      sources: Array.isArray(sources) ? sources : [],
-      tracks: Array.isArray(tracks) ? tracks : [],
-      headers: root.headers || data.headers || {},
-    };
+    return { sources: sources, tracks: tracks, headers: headers };
   }
 
-  async getSignsAndSongsSubtitles(animeId, episodeNumber, existingResult) {
-    try {
-      // AnimeX's neko dub response exposes the forced English track used for
-      // translated signs and songs. It is independent of the selected video source.
-      const result = existingResult || await this.getSources(animeId, episodeNumber, "dub", "neko");
-      const tracks = this.sourcePayload(result).tracks;
+  absoluteUrl(value, base) {
+    const url = String(value || "").trim();
+    if (!url || /[\s\\]/.test(url)) return "";
+    if (/^https?:\/\/[^/]+/i.test(url)) return url;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return "";
+    const match = String(base || "").match(/^(https?:)\/\/([^/?#]+)([^?#]*)/i);
+    if (!match) return "";
+    if (url.indexOf("//") === 0) return match[1] + url;
+    const origin = match[1] + "//" + match[2];
+    if (url[0] === "?") return origin + (match[3] || "/") + url;
+    if (url[0] === "#") return "";
+    const path = url[0] === "/" ? url : (match[3] || "/").replace(/[^/]*$/, "") + url;
+    const suffixAt = path.search(/[?#]/);
+    const suffix = suffixAt < 0 ? "" : path.slice(suffixAt);
+    const parts = (suffixAt < 0 ? path : path.slice(0, suffixAt)).split("/");
+    const out = [];
+    parts.forEach(function (part) {
+      if (part === "..") { if (out.length > 1) out.pop(); }
+      else if (part !== ".") out.push(part);
+    });
+    return origin + out.join("/") + suffix;
+  }
 
-      for (let i = 0; i < tracks.length; i++) {
-        const track = tracks[i];
-        if (!track || typeof track !== "object") continue;
+  normalizeSubtitleTracks(tracks, type, base) {
+    const seen = Object.create(null);
+    const normalized = [];
+    (Array.isArray(tracks) ? tracks : []).forEach(function (track) {
+      if (!track || typeof track !== "object") return;
+      const label = String(track.label || track.name || track.language || track.lang || track.srclang || "").trim();
+      const lang = String(track.srclang || track.lang || track.language || label).trim();
+      const kind = String(track.kind || "").toLowerCase();
+      const raw = String(track.file || track.url || track.src || "").trim();
+      const format = String(track.type || track.format || track.mimeType || "").toLowerCase();
+      if (kind && kind !== "subtitles" && kind !== "captions" && kind !== "subtitle") return;
+      if (/thumbnail|sprite|chapter|metadata/i.test(label + " " + format + " " + raw) ||
+          /#xywh|\.(?:jpe?g|png|webp|gif|avif)(?:[?#]|$)/i.test(raw)) return;
+      // Seanime's player parses WebVTT directly; do not mislabel SRT/ASS as VTT.
+      if (!/\.vtt(?:[?#]|$)/i.test(raw) && !/^(?:vtt|text\/vtt)$/.test(format)) return;
+      if (/\.(?:srt|ass|ssa)(?:[?#]|$)/i.test(raw)) return;
+      const url = this.absoluteUrl(raw, base);
+      if (!url || seen[url]) return;
+      const english = /^(?:en|eng)(?:[-_ ]|$)|english/i.test(lang) || /\benglish\b/i.test(label);
+      const forced = track.forced === true || track.isForced === true ||
+        /\bforced\b|\bsigns?\b|\bsongs?\b/i.test(label);
+      if (type === "dub" && (!english || !forced)) return;
+      seen[url] = true;
+      normalized.push({
+        id: "subtitle-" + normalized.length,
+        url: url,
+        language: english ? "en" : (lang || "und"),
+        isDefault: false,
+        english: english,
+        forced: forced,
+        preferred: track.default === true || track.isDefault === true,
+      });
+    }, this);
+    let index = normalized.findIndex(function (track) { return track.english && !track.forced; });
+    if (index < 0) index = normalized.findIndex(function (track) { return track.english; });
+    if (index < 0) index = normalized.findIndex(function (track) { return track.preferred; });
+    if (index < 0 && normalized.length) index = 0;
+    return normalized.map(function (track, i) {
+      return { id: track.id, url: track.url, language: track.language, isDefault: i === index };
+    });
+  }
 
-        const label = String(track.label || track.language || track.lang || track.srclang || "")
-          .toLowerCase()
-          .trim();
-        const kind = String(track.kind || "").toLowerCase().trim();
-        const isEnglish = label === "english" || label === "eng" || label === "en" ||
-          label.indexOf("english (") === 0;
-        const isCaption = !kind || kind === "captions" || kind === "subtitles";
-        const url = String(track.file || track.url || track.src || "").trim();
+  buildPlaybackHeaders(payload, source, provider) {
+    const headers = {};
+    const canonical = { referer: "Referer", origin: "Origin", accept: "Accept", "user-agent": "User-Agent" };
+    [payload.headers, source.headers].forEach(function (value) {
+      Object.keys(value || {}).forEach(function (key) {
+        if (typeof value[key] === "string") headers[canonical[key.toLowerCase()] || key] = value[key];
+      });
+    });
+    const url = String(source.url || source.file || source.link || "");
+    if (provider === "zuna" && /^https?:\/\/hls\.1embed\.buzz(?::\d+)?\//i.test(url)) {
+      if (!headers.Referer) headers.Referer = "https://zokoanime.video/";
+      if (!headers.Origin) headers.Origin = "https://zokoanime.video";
+      if (!headers.Accept) headers.Accept = "*/*";
+      if (!headers["User-Agent"]) headers["User-Agent"] = this.UA;
+    }
+    return headers;
+  }
 
-        if (isEnglish && isCaption && /^https?:\/\/\S+\.vtt(?:[?#]\S*)?$/i.test(url)) {
-          return [{
-            id: "signs-songs-en",
-            url: url,
-            language: "en",
-            isDefault: true,
-          }];
+  isHlsSource(source) {
+    return /\.m3u8(?:[?#]|$)/i.test(String(source.url || source.file || source.link || "")) ||
+      /^(?:hls|m3u8|application\/(?:vnd\.apple\.mpegurl|x-mpegurl)|video\/mpegurl)$/i
+        .test(String(source.type || source.mimeType || source.format || ""));
+  }
+
+  async probeHlsSource(url, headers, deadline, checkSegment, type) {
+    let current = url;
+    // Some backends nest master playlists. Bound traversal and reject cycles.
+    const visited = Object.create(null);
+    for (let depth = 0; depth < 3; depth++) {
+      if (visited[current]) throw new Error("HLS playlist cycle");
+      visited[current] = true;
+      const response = await this.fetchBefore(current, { headers: headers }, deadline);
+      if (!response.ok) throw new Error("HLS playlist HTTP " + response.status);
+      const body = String(await response.text()).replace(/^\uFEFF/, "").trim();
+      if (!/^#EXTM3U(?:\s|$)/.test(body)) throw new Error("Invalid HLS playlist");
+      const base = response.url || current;
+      const lines = body.split(/\r?\n/).map(function (line) { return line.trim(); });
+      // Seanime cannot force an HLS audio rendition through EpisodeServer.
+      // Reject explicitly wrong/ambiguous defaults instead of mislabeling audio.
+      const audio = lines.filter(function (line) {
+        return /^#EXT-X-MEDIA:/.test(line) && /(?:[:,])TYPE=AUDIO(?:,|$)/.test(line);
+      });
+      if (audio.length) {
+        const defaults = audio.filter(function (line) { return /(?:[:,])DEFAULT=YES(?:,|$)/.test(line); });
+        const choices = defaults.length ? defaults : audio;
+        const desired = type === "dub" ? /^(?:en|eng|english)(?:[-_ ]|$)/i : /^(?:ja|jpn|japanese)(?:[-_ ]|$)/i;
+        if (!choices.every(function (line) {
+          const language = line.match(/(?:[:,])LANGUAGE="([^"]+)"/);
+          const name = line.match(/(?:[:,])NAME="([^"]+)"/);
+          return desired.test(language ? language[1] : (name ? name[1] : ""));
+        })) throw new Error("HLS default audio does not match " + type);
+      }
+      const variants = [];
+      let bandwidth = null;
+      let segment = "";
+      let media = false;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.indexOf("#EXT-X-STREAM-INF:") === 0) {
+          const match = line.match(/(?:^|[:,])BANDWIDTH=(\d+)/);
+          bandwidth = match ? Number(match[1]) : 0;
+        } else if (line.indexOf("#EXTINF:") === 0) {
+          media = true;
+        } else if (line && line[0] !== "#") {
+          if (bandwidth !== null) { variants.push({ uri: line, bandwidth: bandwidth }); bandwidth = null; }
+          else if (media && !segment) segment = line;
         }
       }
-    } catch (error) {
-      // Subtitle augmentation is best-effort and must never block playback.
+      if (variants.length) {
+        variants.sort(function (a, b) { return a.bandwidth - b.bandwidth; });
+        current = this.absoluteUrl(variants[0].uri, base);
+        if (!current) throw new Error("Invalid HLS variant URL");
+        continue;
+      }
+      if (!media || !segment) throw new Error("HLS playlist has no media segments");
+      const segmentUrl = this.absoluteUrl(segment, base);
+      if (!segmentUrl) throw new Error("Invalid HLS segment URL");
+      if (checkSegment) {
+        // Goja buffers fetch bodies. HEAD avoids a full segment download even
+        // when a CDN ignores Range; never retry this probe with GET.
+        const head = await this.fetchBefore(segmentUrl, { method: "HEAD", headers: headers }, deadline);
+        if (!head.ok && head.status !== 405 && head.status !== 501) {
+          throw new Error("HLS segment HTTP " + head.status);
+        }
+        if (head.ok && /text\/html|application\/json/i.test(String(head.contentType ||
+            (head.headers && (head.headers["Content-Type"] || head.headers["content-type"])) || ""))) {
+          throw new Error("HLS segment returned a non-media response");
+        }
+      }
+      return;
     }
+    throw new Error("HLS playlist nesting limit reached");
+  }
 
-    return [];
+  async selectHealthyProvider(animeId, episodeNumber, type) {
+    const deadline = Date.now() + this.SELECTION_TIMEOUT_MS;
+    let discovered = [];
+    let discoveryFailed = false;
+    try {
+      const servers = await this.getServers(animeId, episodeNumber, Math.min(deadline, Date.now() + this.SERVER_TIMEOUT_MS));
+      discovered = this.serverProviders(servers, type);
+    } catch (error) {
+      discoveryFailed = true;
+      console.log("[AnimeX] server discovery failed; using limited " + type + " fallback");
+    }
+    const candidates = this.orderProviders(discoveryFailed ?
+      (type === "dub" ? ["yuki", "sora"] : ["zuna", "yuki"]) : discovered, type);
+    console.log("[AnimeX] mode=" + type + " advertised=" + discovered.join(","));
+    console.log("[AnimeX] candidates=" + candidates.join(","));
+    for (let i = 0; i < candidates.length && Date.now() < deadline - 1000; i++) {
+      const provider = candidates[i];
+      const key = [animeId, episodeNumber, type, provider].join("|");
+      const cached = this.healthCache[key];
+      if (cached && cached.expires > Date.now() && !cached.healthy) continue;
+      try {
+        console.log("[AnimeX] trying type=" + type + " provider=" + provider + " episode=" + episodeNumber);
+        const started = Date.now();
+        const result = await this.getSources(animeId, episodeNumber, type, provider,
+          Math.min(deadline, started + this.SOURCE_TIMEOUT_MS));
+        console.log("[AnimeX] " + provider + " source API resolved in " + (Date.now() - started) + "ms");
+        const payload = this.sourcePayload(result);
+        const probeStarted = Date.now();
+        const probeDeadline = Math.min(deadline, probeStarted + this.PROBE_TIMEOUT_MS);
+        let selected = null;
+        for (let j = 0; j < payload.sources.length && j < 3; j++) {
+          const source = payload.sources[j];
+          if (!source || typeof source !== "object") continue;
+          const url = this.absoluteUrl(source.url || source.file || source.link);
+          if (!url) continue;
+          const headers = this.buildPlaybackHeaders(payload, source, provider);
+          const hls = this.isHlsSource(source);
+          try {
+            // Cache is tied to the precise URL and headers; a new signed URL
+            // never inherits the previous URL's successful playback decision.
+            const fingerprint = url + JSON.stringify(headers);
+            if (!cached || cached.expires <= Date.now() || !cached.healthy || cached.fingerprint !== fingerprint) {
+              if (hls) await this.probeHlsSource(url, headers, probeDeadline, provider === "zuna", type);
+              else {
+                const response = await this.fetchBefore(url, { method: "HEAD", headers: headers }, probeDeadline);
+                if (!response.ok) throw new Error("Video probe HTTP " + response.status);
+              }
+            }
+            const tracks = payload.tracks.concat(Array.isArray(source.tracks) ? source.tracks : [],
+              Array.isArray(source.subtitles) ? source.subtitles : []);
+            const subtitles = this.normalizeSubtitleTracks(tracks, type, url);
+            const video = { url: url, quality: source.quality || source.qualityLabel || source.label || "auto",
+              type: hls ? "m3u8" : "mp4", subtitles: subtitles };
+            selected = { server: provider, headers: headers, videoSources: [video] };
+            this.healthCache[key] = { healthy: true, expires: Date.now() + 30000, fingerprint: fingerprint };
+            break;
+          } catch (error) {
+            console.log("[AnimeX] " + provider + " playback probe failed after " + (Date.now() - probeStarted) +
+              "ms: " + String(error && error.message || "invalid stream"));
+          }
+        }
+        if (selected) {
+          console.log("[AnimeX] selected type=" + type + " provider=" + provider +
+            " subtitles=" + selected.videoSources[0].subtitles.length);
+          return selected;
+        }
+        throw new Error("No healthy video source");
+      } catch (error) {
+        this.healthCache[key] = { healthy: false, expires: Date.now() + 10000 };
+        console.log("[AnimeX] " + provider + " failed type=" + type + ": " + String(error && error.message || "request failed"));
+        if (i + 1 < candidates.length) console.log("[AnimeX] falling back to " + candidates[i + 1]);
+      }
+    }
+    throw new Error("AnimeX returned no playable " + type.toUpperCase() + " sources for episode " + episodeNumber + ".");
   }
 
   async findEpisodeServer(episode, server) {
@@ -377,146 +583,6 @@ class Provider {
     if (episodeMode && requestedType !== episodeMode) {
       throw new Error("AnimeX skipping " + requestedType + " server while in " + episodeMode + " mode.");
     }
-    let servers = {};
-
-    try {
-      servers = await this.getServers(animeId, episodeNumber);
-    } catch (error) {
-      // Older API versions do not expose /servers; use the known IDs below.
-    }
-
-    const discoveredProviders = this.serverProviders(servers, type);
-    const primaryProvider = type === "dub" ? "yuki" : "zuna";
-    const fallbackOrder = type === "dub"
-      ? ["mimi", "uwu", "kiwi", "miku", "neko", "shiro"]
-      : ["beep", "mimi", "kiwi", "uwu", "miku", "mochi", "vee", "neko", "shiro", "yuki"];
-
-    let providers = [];
-
-    // Match the player behavior deliberately:
-    //   SUB -> Zuna
-    //   DUB -> Yuki
-    // If that primary provider is advertised for the episode, do not expose
-    // other AnimeX backends as competing servers for the same audio mode.
-    if (discoveredProviders.indexOf(primaryProvider) !== -1) {
-      providers = [primaryProvider];
-    } else if (discoveredProviders.length) {
-      providers = discoveredProviders.slice().sort(function (a, b) {
-        const ai = fallbackOrder.indexOf(a);
-        const bi = fallbackOrder.indexOf(b);
-        if (ai === -1 && bi === -1) return 0;
-        if (ai === -1) return 1;
-        if (bi === -1) return -1;
-        return ai - bi;
-      });
-    } else {
-      providers = [primaryProvider].concat(fallbackOrder);
-    }
-
-    console.log(
-      "[AnimeX] mode=" + type +
-      " primary=" + primaryProvider +
-      " providers=" + providers.join(",")
-    );
-
-    const requestedProvider = requested
-      .replace(/-(?:sub|dub)/g, "")
-      .replace(/\s+/g, "");
-    if (providers.indexOf(requestedProvider) !== -1) {
-      providers = [requestedProvider].concat(providers.filter(function (id) {
-        return id !== requestedProvider;
-      }));
-    }
-
-    let data = null;
-    let usedProvider = null;
-    for (let i = 0; i < providers.length; i++) {
-      try {
-        console.log(
-          "[AnimeX] Trying " + type + " provider=" + providers[i] +
-          " episode=" + episodeNumber
-        );
-        const result = await this.getSources(animeId, episodeNumber, type, providers[i]);
-        const payload = this.sourcePayload(result);
-        const playableSources = payload.sources.filter(function (source) {
-          return source && (source.url || source.file || source.link);
-        });
-
-        // Sora/Yuki currently return HLS hosts that can pass AnimeX source
-        // discovery but fail in Seanime with HTTP 403. Do not select those
-        // blocked CDNs when another AnimeX backend is available.
-        const hasUsableSource = playableSources.some(function (source) {
-          const url = String(source.url || source.file || source.link || "").toLowerCase();
-          return url.indexOf("hls.krussdomi.com") === -1 &&
-            url.indexOf("cdn.watching.onl") === -1;
-        });
-
-        if (hasUsableSource) {
-          data = result;
-          usedProvider = providers[i];
-          break;
-        }
-        console.log(
-          "[AnimeX] " + providers[i] + " returned no playable " + type +
-          " source for episode " + episodeNumber
-        );
-      } catch (error) {
-        console.log(
-          "[AnimeX] " + providers[i] + " failed for " + type +
-          " episode=" + episodeNumber + ": " + String(error && error.message || error)
-        );
-        // Try the next provider.
-      }
-    }
-
-    if (!data) {
-      throw new Error("AnimeX returned no playable " + type.toUpperCase() + " sources for episode " + episodeNumber + ".");
-    }
-
-    const responseData = this.sourcePayload(data);
-    const signsAndSongsSubtitles = type === "dub"
-      ? await this.getSignsAndSongsSubtitles(
-        animeId,
-        episodeNumber,
-        usedProvider === "neko" ? data : null
-      )
-      : [];
-    const videoSources = responseData.sources.filter(function (source) {
-      if (!source || !(source.url || source.file || source.link)) return false;
-      const url = String(source.url || source.file || source.link || "").toLowerCase();
-      return url.indexOf("hls.krussdomi.com") === -1 &&
-        url.indexOf("cdn.watching.onl") === -1;
-    }).map(function (source) {
-      const url = source.url || source.file || source.link;
-      const isHls = source.type === "video/mpegurl" || String(url).indexOf(".m3u8") !== -1 || source.format === "hls";
-      const videoSource = {
-        url: url,
-        quality: source.quality || source.qualityLabel || source.label || "auto",
-        type: isHls ? "m3u8" : (source.type || source.mimeType || "mp4"),
-      };
-      if (signsAndSongsSubtitles.length) {
-        videoSource.subtitles = signsAndSongsSubtitles;
-      }
-      return videoSource;
-    });
-
-    const playbackHeaders = Object.assign({}, responseData.headers || {});
-    if (usedProvider === "zuna" && videoSources.some(function (source) {
-      return String(source && source.url || "").toLowerCase().indexOf("hls.1embed.buzz") !== -1;
-    })) {
-      // Zuna's HLS host expects the same request context used by its player.
-      // Forward both Referer and Origin to the master playlist, variants, and
-      // segments; sending only Referer can make 1embed stall or retry slowly.
-      playbackHeaders.Referer = "https://zokoanime.video/";
-      playbackHeaders.Origin = "https://zokoanime.video";
-      playbackHeaders.Accept = "*/*";
-      if (!playbackHeaders["User-Agent"]) playbackHeaders["User-Agent"] = this.UA;
-    }
-
-    return {
-      server: usedProvider,
-      headers: playbackHeaders,
-      videoSources: videoSources,
-    };
+    return await this.selectHealthyProvider(animeId, episodeNumber, type);
   }
 }

@@ -1,0 +1,16 @@
+diff --git a/internal/goja/goja_bindings/fetch.go b/internal/goja/goja_bindings/fetch.go
+--- a/internal/goja/goja_bindings/fetch.go
++++ b/internal/goja/goja_bindings/fetch.go
+@@ -320,8 +320,10 @@
+ 			}
+ 			if o := rawOpts.Get("timeout"); o != nil && !goja.IsUndefined(o) {
+-				if v, ok := o.Export().(int); ok {
+-					options.Timeout = v
++				// JavaScript integer numbers export as int64 in Goja, not int.
++				// Keep a positive, bounded timeout in seconds.
++				if v := o.ToInteger(); v > 0 && v <= 86400 {
++					options.Timeout = int(v)
+ 				}
+ 			}
+ 			if o := rawOpts.Get("headers"); o != nil && !goja.IsUndefined(o) {
+ 				if v, ok := o.Export().(map[string]interface{}); ok {
