@@ -2,10 +2,7 @@ class Provider {
   constructor() {
     this.ANIMEX = "https://animex.one";
     this.API = "https://pp.animex.one";
-    this.API_MIRROR = "https://chad.anidap.lol";
     this.GRAPHQL = "https://graphql.animex.one/graphql";
-    this.CDN_PROXY = "https://cdnx.aniwatchtv.site";
-    this.UWU_KEY = "10b06cdc1ca48c9fb0b94af97cc040cf";
     this.UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36";
   }
 
@@ -146,29 +143,31 @@ class Provider {
   }
 
   async getSources(id, episodeNumber, type, providerId) {
-    const path = "/rest/api/sources?id=" + encodeURIComponent(id) +
+    const url = this.API + "/rest/api/sources?id=" + encodeURIComponent(id) +
       "&epNum=" + encodeURIComponent(episodeNumber) +
       "&type=" + encodeURIComponent(type) +
       "&providerId=" + encodeURIComponent(providerId);
 
-    try {
-      return await this.getJSON(this.API + path);
-    } catch (error) {
-      const message = String(error && error.message || error);
-      const transient = /HTTP\s+(502|503|504)\b/.test(message);
+    const maxAttempts = providerId === "yuki" && type === "dub" ? 2 : 1;
+    let lastError = null;
 
-      // Yuki dub occasionally times out on pp.animex.one even though the same
-      // source is available from the maintained AnimeX/Anidap REST mirror.
-      if (providerId === "yuki" && type === "dub" && transient) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.getJSON(url);
+      } catch (error) {
+        lastError = error;
+        const message = String(error && error.message || error);
+        const transient = /HTTP\s+(502|503|504)\b/.test(message);
+        if (!transient || attempt >= maxAttempts) throw error;
+
         console.log(
-          "[AnimeX] Primary Yuki dub source timed out; trying REST mirror" +
-          " episode=" + episodeNumber
+          "[AnimeX] Retrying Yuki dub after transient failure" +
+          " attempt=" + attempt + " episode=" + episodeNumber
         );
-        return await this.getJSON(this.API_MIRROR + path);
       }
-
-      throw error;
     }
+
+    throw lastError || new Error("AnimeX source request failed.");
   }
 
   normalizeServer(server) {
@@ -329,93 +328,6 @@ class Provider {
     return [];
   }
 
-  utf8Bytes(value) {
-    const text = String(value || "");
-    const out = [];
-    for (let i = 0; i < text.length; i++) {
-      let code = text.charCodeAt(i);
-      if (code < 0x80) {
-        out.push(code);
-      } else if (code < 0x800) {
-        out.push(0xc0 | (code >> 6));
-        out.push(0x80 | (code & 0x3f));
-      } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
-        const next = text.charCodeAt(++i);
-        const cp = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
-        out.push(0xf0 | (cp >> 18));
-        out.push(0x80 | ((cp >> 12) & 0x3f));
-        out.push(0x80 | ((cp >> 6) & 0x3f));
-        out.push(0x80 | (cp & 0x3f));
-      } else {
-        out.push(0xe0 | (code >> 12));
-        out.push(0x80 | ((code >> 6) & 0x3f));
-        out.push(0x80 | (code & 0x3f));
-      }
-    }
-    return out;
-  }
-
-  base64Url(bytes) {
-    const table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let out = "";
-    for (let i = 0; i < bytes.length; i += 3) {
-      const b0 = bytes[i];
-      const has1 = i + 1 < bytes.length;
-      const has2 = i + 2 < bytes.length;
-      const b1 = has1 ? bytes[i + 1] : 0;
-      const b2 = has2 ? bytes[i + 2] : 0;
-
-      out += table[b0 >> 2];
-      out += table[((b0 & 3) << 4) | (b1 >> 4)];
-      out += has1 ? table[((b1 & 15) << 2) | (b2 >> 6)] : "=";
-      out += has2 ? table[b2 & 63] : "=";
-    }
-    return out.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-  }
-
-  animeXProxyUrl(rawUrl, referer, userAgent) {
-    if (!rawUrl || String(rawUrl).indexOf("/uwu/") !== -1) return rawUrl;
-
-    let payload = this.utf8Bytes(rawUrl);
-    payload.push(0);
-    payload = payload.concat(this.utf8Bytes(referer || ""));
-
-    if (userAgent) {
-      payload.push(0);
-      payload = payload.concat(this.utf8Bytes(userAgent));
-    }
-
-    const key = this.utf8Bytes(this.UWU_KEY);
-    const encoded = payload.map(function (value, index) {
-      return value ^ key[index % key.length];
-    });
-
-    return this.CDN_PROXY + "/uwu/" + this.base64Url(encoded);
-  }
-
-  transformSourceUrl(rawUrl, providerId, headers) {
-    let url = String(rawUrl || "");
-    const provider = String(providerId || "").toLowerCase();
-    const h = headers || {};
-    const apiReferer = h.Referer || h.referer || "";
-    const apiUserAgent = h["User-Agent"] || h["user-agent"] || "";
-
-    // AnimeX's web player wraps these hosts through its CDN proxy. Returning
-    // their raw URLs directly is what caused Zuna buffering/timeouts and Yuki/
-    // Sora 403s in Seanime.
-    if (provider === "yuki") {
-      return this.animeXProxyUrl(url, apiReferer || "https://megaplay.buzz/", apiUserAgent);
-    }
-    if (provider === "sora") {
-      return this.animeXProxyUrl(url, apiReferer || "https://krussdomi.com/", apiUserAgent);
-    }
-    if (provider === "zuna") {
-      return this.animeXProxyUrl(url, apiReferer || "https://zokoanime.video/", apiUserAgent || this.UA);
-    }
-
-    return url;
-  }
-
   async findEpisodeServer(episode, server) {
     const item = episode && typeof episode === "object"
       ? episode
@@ -530,9 +442,14 @@ class Provider {
           return source && (source.url || source.file || source.link);
         });
 
-        // Raw Yuki/Sora/Zuna URLs are rewritten through AnimeX's CDN proxy
-        // before playback, so the API returning a source is enough here.
-        const hasUsableSource = playableSources.length > 0;
+        // Sora/Yuki currently return HLS hosts that can pass AnimeX source
+        // discovery but fail in Seanime with HTTP 403. Do not select those
+        // blocked CDNs when another AnimeX backend is available.
+        const hasUsableSource = playableSources.some(function (source) {
+          const url = String(source.url || source.file || source.link || "").toLowerCase();
+          return url.indexOf("hls.krussdomi.com") === -1 &&
+            url.indexOf("cdn.watching.onl") === -1;
+        });
 
         if (hasUsableSource) {
           data = result;
@@ -565,11 +482,13 @@ class Provider {
       )
       : [];
     const videoSources = responseData.sources.filter(function (source) {
-      return source && (source.url || source.file || source.link);
+      if (!source || !(source.url || source.file || source.link)) return false;
+      const url = String(source.url || source.file || source.link || "").toLowerCase();
+      return url.indexOf("hls.krussdomi.com") === -1 &&
+        url.indexOf("cdn.watching.onl") === -1;
     }).map(function (source) {
-      const rawUrl = source.url || source.file || source.link;
-      const url = this.transformSourceUrl(rawUrl, usedProvider, responseData.headers);
-      const isHls = source.type === "video/mpegurl" || String(rawUrl).indexOf(".m3u8") !== -1 || source.format === "hls";
+      const url = source.url || source.file || source.link;
+      const isHls = source.type === "video/mpegurl" || String(url).indexOf(".m3u8") !== -1 || source.format === "hls";
       const videoSource = {
         url: url,
         quality: source.quality || source.qualityLabel || source.label || "auto",
@@ -579,16 +498,17 @@ class Provider {
         videoSource.subtitles = signsAndSongsSubtitles;
       }
       return videoSource;
-    }, this);
-
-    // The upstream referer/user-agent are encoded into AnimeX's /uwu/ proxy URL.
-    // Only send a normal browser UA to the proxy itself.
-    const usesAnimeXProxy = videoSources.some(function (source) {
-      return String(source && source.url || "").indexOf("/uwu/") !== -1;
     });
-    const playbackHeaders = usesAnimeXProxy
-      ? { "User-Agent": this.UA }
-      : Object.assign({}, responseData.headers || {});
+
+    const playbackHeaders = Object.assign({}, responseData.headers || {});
+    if (usedProvider === "zuna" && videoSources.some(function (source) {
+      return String(source && source.url || "").toLowerCase().indexOf("hls.1embed.buzz") !== -1;
+    })) {
+      // hls.1embed.buzz is referer-gated. Seanime's HLS proxy forwards these
+      // EpisodeServer headers to the master playlist, variants, and segments.
+      playbackHeaders.Referer = "https://zokoanime.video/";
+      if (!playbackHeaders["User-Agent"]) playbackHeaders["User-Agent"] = this.UA;
+    }
 
     return {
       server: usedProvider,
