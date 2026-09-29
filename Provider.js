@@ -334,16 +334,17 @@ class Provider {
       // Older API versions do not expose /servers; use the known IDs below.
     }
 
-    let providers = this.serverProviders(servers, type);
+    const discoveredProviders = this.serverProviders(servers, type);
 
-    // AnimeX can report only a subset of providers for an episode even when
-    // another backend still has a playable source. Keep API-reported providers
-    // first, then append known fallbacks so Sub and Dub stay resilient.
-    const fallbackProviders = type === "dub"
-      ? ["yuki", "neko", "sora", "koto", "anmx"]
-      : ["beep", "yuki", "sora", "koto", "anmx"];
+    // Prefer the AnimeX backends that are most likely to carry the requested
+    // language, then append anything returned by /servers. Yuki is deliberately
+    // late in the DUB order because it can return a playable stream whose audio
+    // is not the English dub for some titles (for example Naruto).
+    const preferredProviders = type === "dub"
+      ? ["anmx", "koto", "sora", "neko", "yuki"]
+      : ["beep", "yuki", "anmx", "koto", "sora"];
 
-    providers = providers.concat(fallbackProviders).filter(function (id, index, array) {
+    let providers = preferredProviders.concat(discoveredProviders).filter(function (id, index, array) {
       return id && array.indexOf(id) === index;
     });
 
