@@ -341,7 +341,7 @@ class Provider {
     // late in the DUB order because it can return a playable stream whose audio
     // is not the English dub for some titles (for example Naruto).
     const preferredProviders = type === "dub"
-      ? ["anmx", "koto", "sora", "neko", "yuki"]
+      ? ["neko", "anmx", "koto", "sora", "yuki"]
       : ["beep", "yuki", "anmx", "koto", "sora"];
 
     let providers = preferredProviders.concat(discoveredProviders).filter(function (id, index, array) {
@@ -367,9 +367,20 @@ class Provider {
         );
         const result = await this.getSources(animeId, episodeNumber, type, providers[i]);
         const payload = this.sourcePayload(result);
-        if (payload.sources.some(function (source) {
+        const playableSources = payload.sources.filter(function (source) {
           return source && (source.url || source.file || source.link);
-        })) {
+        });
+
+        // Sora/Yuki currently return HLS hosts that can pass AnimeX source
+        // discovery but fail in Seanime with HTTP 403. Do not select those
+        // blocked CDNs when another AnimeX backend is available.
+        const hasUsableSource = playableSources.some(function (source) {
+          const url = String(source.url || source.file || source.link || "").toLowerCase();
+          return url.indexOf("hls.krussdomi.com") === -1 &&
+            url.indexOf("cdn.watching.onl") === -1;
+        });
+
+        if (hasUsableSource) {
           data = result;
           usedProvider = providers[i];
           break;
