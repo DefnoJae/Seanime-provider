@@ -60,8 +60,10 @@ class Provider {
 
   async search(input) {
     let query = input;
+    let dubbed = false;
     if (input && typeof input === "object") {
       query = input.query || input.title || input.search || input.keyword || input.name || "";
+      dubbed = Boolean(input.dub);
     }
     query = String(query || "").trim();
     if (!query) return [];
@@ -78,11 +80,13 @@ class Provider {
     }).map(function (item) {
       const title = item.titleEnglish || item.titleRomaji || String(item.id);
       return {
-        // This is AnimeX's internal ID. Do not replace it with the AniList ID.
-        id: String(item.id),
+        // Keep Seanime's requested audio mode in the match ID. Seanime calls
+        // search with input.dub=true after "Switch to dubs", so this lets the
+        // episode list and server resolver stay strictly SUB or strictly DUB.
+        id: String(item.id) + "$" + (dubbed ? "dub" : "sub"),
         title: this.cleanText(title),
         url: this.ANIMEX + "/anime/" + encodeURIComponent(String(item.id)),
-        subOrDub: "both",
+        subOrDub: dubbed ? "dub" : "sub",
       };
     }, this);
   }
@@ -94,9 +98,19 @@ class Provider {
     }
 
     animeId = String(animeId || "");
+    let audioMode = "sub";
+
+    const modeMatch = animeId.match(/\$(sub|dub)$/i);
+    if (modeMatch) {
+      audioMode = modeMatch[1].toLowerCase();
+      animeId = animeId.slice(0, -modeMatch[0].length);
+    }
+
     const pathMatch = animeId.match(/\/anime\/([^?#/]+)/i);
     if (pathMatch) animeId = pathMatch[1];
     animeId = decodeURIComponent(animeId.replace(/^\/+|\/+$/g, ""));
+
+    console.log("[AnimeX] Episode list mode=" + audioMode + " animeId=" + animeId);
 
     const data = await this.getJSON(
       this.API + "/rest/api/episodes?id=" + encodeURIComponent(animeId)
@@ -109,13 +123,13 @@ class Provider {
     return list.map(function (item, index) {
       const number = Number(item.number || item.episode || item.epNum || item.ep || index + 1);
       return {
-        // Keep the internal AnimeX ID available for findEpisodeServer.
-        id: animeId + "-episode-" + number,
+        // Encode the selected audio mode in the episode ID. Extra object fields
+        // are not guaranteed to survive Seanime's Go struct conversion, but ID does.
+        id: animeId + "-episode-" + number + "$" + audioMode,
         animeId: animeId,
         title: item.title || "Episode " + number,
         number: number,
-        // This URL is informational only. findEpisodeServer does not scrape it.
-        url: this.ANIMEX + "/watch/" + animeId + "-episode-" + number,
+        url: this.ANIMEX + "/watch/" + animeId + "-episode-" + number + "?audio=" + audioMode,
       };
     }, this);
   }
@@ -303,13 +317,23 @@ class Provider {
     let animeId = item.animeId || item.internalId || item.mediaId || "";
     let episodeNumber = Number(item.number || item.episode || 0);
     const idText = String(item.id || "");
+    let episodeMode = "";
 
+    const modeMatch = idText.match(/\$(sub|dub)$/i);
+    if (modeMatch) episodeMode = modeMatch[1].toLowerCase();
+
+    const cleanIdText = idText.replace(/\$(sub|dub)$/i, "");
     if (!animeId) {
-      const episodeMatch = idText.match(/^(.*)-episode-(\d+)$/i);
+      const episodeMatch = cleanIdText.match(/^(.*)-episode-(\d+)$/i);
       if (episodeMatch) {
         animeId = episodeMatch[1];
         if (!episodeNumber) episodeNumber = Number(episodeMatch[2]);
       }
+    }
+
+    if (!episodeMode && item.url) {
+      const audioMatch = String(item.url).match(/[?&]audio=(sub|dub)/i);
+      if (audioMatch) episodeMode = audioMatch[1].toLowerCase();
     }
 
     if (!animeId && item.url) {
@@ -325,7 +349,15 @@ class Provider {
     }
 
     const requested = this.normalizeServer(server);
-    const type = requested.indexOf("dub") !== -1 ? "dub" : "sub";
+    const requestedType = requested.indexOf("dub") !== -1 ? "dub" : "sub";
+    const type = episodeMode || requestedType;
+
+    // Seanime asks every configured episode server for the current episode.
+    // Return only the server matching the mode encoded by search/findEpisodes,
+    // otherwise SUB and DUB appear together in the dropdown.
+    if (episodeMode && requestedType !== episodeMode) {
+      throw new Error("AnimeX skipping " + requestedType + " server while in " + episodeMode + " mode.");
+    }
     let servers = {};
 
     try {
@@ -336,17 +368,26 @@ class Provider {
 
     const discoveredProviders = this.serverProviders(servers, type);
 
-    // Prefer the AnimeX backends that are most likely to carry the requested
-    // language, then append anything returned by /servers. Yuki is deliberately
-    // late in the DUB order because it can return a playable stream whose audio
-    // is not the English dub for some titles (for example Naruto).
     const preferredProviders = type === "dub"
-      ? ["neko", "anmx", "koto", "sora", "yuki"]
-      : ["beep", "yuki", "anmx", "koto", "sora"];
+      ? ["mimi", "uwu", "kiwi", "miku", "zuna", "mochi", "vee", "neko", "shiro", "yuki", "sora"]
+      : ["zuna", "beep", "mimi", "kiwi", "uwu", "miku", "mochi", "vee", "neko", "shiro", "yuki", "sora"];
 
-    let providers = preferredProviders.concat(discoveredProviders).filter(function (id, index, array) {
-      return id && array.indexOf(id) === index;
+    // If AnimeX reports providers for this exact audio type, use only those
+    // providers and sort them by preference. This avoids probing stale IDs.
+    let providers = discoveredProviders.length
+      ? discoveredProviders.slice()
+      : preferredProviders.slice();
+
+    providers.sort(function (a, b) {
+      const ai = preferredProviders.indexOf(a);
+      const bi = preferredProviders.indexOf(b);
+      if (ai === -1 && bi === -1) return 0;
+      if (ai === -1) return 1;
+      if (bi === -1) return -1;
+      return ai - bi;
     });
+
+    console.log("[AnimeX] " + type + " providers=" + providers.join(","));
 
     const requestedProvider = requested
       .replace(/-(?:sub|dub)/g, "")
@@ -411,7 +452,10 @@ class Provider {
       )
       : [];
     const videoSources = responseData.sources.filter(function (source) {
-      return source && (source.url || source.file || source.link);
+      if (!source || !(source.url || source.file || source.link)) return false;
+      const url = String(source.url || source.file || source.link || "").toLowerCase();
+      return url.indexOf("hls.krussdomi.com") === -1 &&
+        url.indexOf("cdn.watching.onl") === -1;
     }).map(function (source) {
       const url = source.url || source.file || source.link;
       const isHls = source.type === "video/mpegurl" || String(url).indexOf(".m3u8") !== -1 || source.format === "hls";
