@@ -190,3 +190,65 @@ func TestHungCandidatesDoNotBlockGoja(t *testing.T) {
 	}
 	t.Log("Real Goja returned Loli DUB while Yuki promise remained unresolved; late Yuki issued no follow-up requests")
 }
+
+func TestProxyIncompatiblePlaylistCannotWin(t *testing.T) {
+	code, err := os.ReadFile("../../Provider.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vm := goja.New()
+	incompatible := false
+	vm.Set("console", map[string]interface{}{"log": func(s string) {
+		if strings.Contains(s, "incompatible with Seanime proxy") {
+			incompatible = true
+		}
+	}})
+	vm.Set("fetch", func(call goja.FunctionCall) goja.Value {
+		url := call.Argument(0).String()
+		var payload interface{}
+		body := ""
+		contentType := ""
+		switch {
+		case strings.Contains(url, "/servers?"):
+			payload = map[string]interface{}{"dubProviders": []string{"yuki", "loli"}}
+		case strings.Contains(url, "/sources?"):
+			sourceURL := "https://good.example/master.m3u8"
+			if strings.Contains(url, "providerId=loli") {
+				sourceURL = "https://loli.example/cdn/master-token?t.m3u8&v.m3u8"
+			}
+			payload = map[string]interface{}{"sources": []interface{}{map[string]interface{}{"url": sourceURL, "type": "application/vnd.apple.mpegurl"}}}
+		case strings.Contains(url, "loli.example"):
+			body = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000\n/cdn/variant-token\n"
+			contentType = "image/jpeg"
+		case strings.Contains(url, "good.example"):
+			body = "#EXTM3U\n#EXTINF:6,\nsegment.ts\n"
+		default:
+			t.Fatalf("unexpected request %s", url)
+		}
+		o := vm.NewObject()
+		o.Set("ok", true)
+		o.Set("status", 200)
+		o.Set("url", url)
+		o.Set("contentType", contentType)
+		o.Set("headers", map[string]string{"Content-Type": contentType})
+		o.Set("json", func() interface{} { return payload })
+		o.Set("text", func() string { return body })
+		return o
+	})
+	if _, err = vm.RunString(string(code)); err != nil {
+		t.Fatal(err)
+	}
+	v, err := vm.RunString(`new Provider().findEpisodeServer({id:"yakuza-episode-9$dub"},"AnimeX Dub")`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := v.Export().(*goja.Promise)
+	if p.State() != goja.PromiseStateFulfilled {
+		t.Fatalf("selection failed: %v", p.Result())
+	}
+	result := p.Result().Export().(map[string]interface{})
+	if result["server"] != "yuki" || !incompatible {
+		t.Fatalf("result=%v incompatible=%v", result, incompatible)
+	}
+	t.Log("Goja rejected extensionless image/jpeg Loli playlist despite source.type=mpegurl and selected Yuki")
+}

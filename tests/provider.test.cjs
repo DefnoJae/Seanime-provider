@@ -274,6 +274,43 @@ test('all advertised providers failing returns a finite useful error without exp
   assert.ok(h.logs.every(log => !log.includes('do-not-log') && !log.includes('secret.example')));
 });
 
+test('extensionless image/jpeg Loli master is rejected before local /cdn paths can reach the player', async () => {
+  const loliURL = 'https://loli.example/cdn/master-token?t.m3u8&v.m3u8';
+  const h = createHarness(url => {
+    if (isAPI(url, 'servers')) return { json: { dubProviders: ['yuki', 'loli'] } };
+    if (isAPI(url, 'sources')) return { json: stream(url.searchParams.get('providerId') === 'loli' ? loliURL : undefined) };
+    if (url.href === loliURL) return { text: '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000\n/cdn/variant-token\n', headers: { 'Content-Type': 'image/jpeg' } };
+  });
+  const result = await h.provider.findEpisodeServer({ id: 'yakuza-episode-9$dub' }, 'AnimeX Dub');
+  assert.equal(result.server, 'yuki');
+  assert.ok(h.logs.some(log => log.includes('loli playback probe failed') && log.includes('incompatible with Seanime proxy')));
+  assert.ok(!h.calls.some(call => new URL(call.url).pathname === '/cdn/variant-token'));
+});
+
+test('a recognized master with an extensionless image/jpeg variant is also rejected', async () => {
+  const h = createHarness(url => {
+    if (isAPI(url, 'servers')) return { json: { subProviders: ['loli'] } };
+    if (isAPI(url, 'sources')) return { json: stream('https://loli.example/master.m3u8') };
+    if (url.pathname === '/master.m3u8') return { text: '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000\n/cdn/variant-token\n' };
+    if (url.pathname === '/cdn/variant-token') return { text: '#EXTM3U\n#EXTINF:6,\n/cdn/segment-token\n', headers: { 'Content-Type': 'image/jpeg' } };
+  });
+  await assert.rejects(() => h.provider.findEpisodeServer({ id: 'fixture-episode-1$sub' }, 'AnimeX Sub'), /no playable SUB/);
+  assert.ok(h.logs.some(log => log.includes('incompatible with Seanime proxy')));
+  assert.ok(!h.calls.some(call => new URL(call.url).pathname === '/cdn/segment-token'));
+});
+
+test('extensionless playlists with genuine HLS MIME and image segments remain supported', async () => {
+  const h = createHarness((url, options) => {
+    if (isAPI(url, 'servers')) return { json: { subProviders: ['loli'] } };
+    if (isAPI(url, 'sources')) return { json: stream('https://loli.example/cdn/master-token') };
+    if (url.pathname === '/cdn/master-token') return { text: '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000\n/cdn/variant-token\n', headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } };
+    if (url.pathname === '/cdn/variant-token') return { text: '#EXTM3U\n#EXTINF:6,\n/cdn/segment.jpg\n', headers: { 'Content-Type': 'application/x-mpegURL' } };
+    if (url.pathname === '/cdn/segment.jpg') { assert.equal(options.method, 'HEAD'); return { headers: { 'Content-Type': 'image/jpeg' } }; }
+  });
+  const result = await h.provider.findEpisodeServer({ id: 'fixture-episode-1$sub' }, 'AnimeX Sub');
+  assert.equal(result.server, 'loli');
+});
+
 test('Naruto Yuki DUB preserves the signed source URL and response playback headers', async () => {
   const workingURL = 'https://cdn.example/naruto/master.m3u8?token=AbC%2Fdef%2Bghi&expires=1900000000';
   const workingHeaders = { Referer: 'https://working-player.example/embed/one', Origin: 'https://working-player.example', 'X-Token': 'header-token' };

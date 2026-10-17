@@ -1,60 +1,51 @@
-# AnimeX 1.0.20 — source-request stalls
+# AnimeX 1.0.21 — HLS proxy compatibility
 
-Prepared on October 17, 2026 from current main `9426f97` (1.0.19). Provider and manifest changes belong to one atomic commit.
+Prepared October 17, 2026 from main `1f2540a` (1.0.20). Provider and manifest changes are published atomically.
 
-## Reported failure and cause
+## Root cause shown by the new playback logs
 
-The supplied logs show Yuki DUB waiting from 12:48:11 until 12:48:34, followed by `Request time budget exhausted`. Refresh issued another request while the first was pending. Nero then also waited, and the player received `no source found for episode` after 23–28 seconds. The screenshot separately reports Nero SUB timing out for episode 2 of `saijo-no-osewa-...-5r98a`.
+The 1.0.20 concurrency change resolved the upstream source stall: the logs show an episode-source response in 0.65–1.09 seconds. However, Loli's fast playlists won the race even though Seanime could not proxy them correctly. The player then requested `/cdn/<token>` on Seanime itself and received a local 404.
 
-The source service can stall or return a gateway error. Additionally, Seanime's current fetch parser still accepts `o.Export().(int)` for timeout, whereas its Goja exports ordinary JS integers as `int64`. The requested 4-second timeout is consequently ignored on affected hosts. The old sequential resolver let a slow source consume the entire 12-second budget before another provider could be validated, and discarded otherwise usable late responses.
+Fresh upstream inspection confirmed that both Loli's master and variant return valid `#EXTM3U` bodies with **Content-Type: image/jpeg** and extensionless `/cdn/<token>` URL paths. The master query contains `t.m3u8&v.m3u8`; this does not make its URL path end in `.m3u8`.
 
-## Fix
+Seanime's actual `videoProxy.isHLSPlaylist` only recognizes upstream `mpegurl` Content-Type or a requested URL path ending in `.m3u8`. An unrecognized playlist is streamed verbatim, leaving root-relative `/cdn/...` children pointed at the local application. The API source's `type: application/vnd.apple.mpegurl` field does not override that HTTP proxy behavior.
 
-- `raceProviders` orders only the current audio mode's advertised providers, removes briefly cached failures and starts at most four candidate pipelines together. It returns the first source that passes playback validation. A pending Yuki or Nero request therefore cannot block a healthy Loli, Yuki or other admitted candidate.
-- `resolveCandidate` preserves the current API `type`, source URL, headers and source-specific subtitles. Late but valid source responses receive a fresh playback-probe budget instead of being discarded by the obsolete global deadline.
-- `selectHealthyProvider` shares overlapping requests for the same anime, episode and mode inside a reused VM. The entry is removed on completion. Other VMs have independent caches.
-- `probeHlsSource` checks the master, a variant and first media segment HEAD for every HLS backend. It excludes explicitly incompatible default audio and avoids video-body downloads. HEAD 405/501 remains an unsupported-method case after valid playlists; other segment errors reject the source. Cache successes require the identical URL and headers.
-- `getSources` avoids redundant transient retries when alternatives already run. A lone Yuki DUB retains its bounded transient retry. Once a winner is chosen, late losing requests cannot initiate further probes/retries or poison the health cache.
-- Manifest version is **1.0.20**.
+The previous upstream body and HEAD checks did not test this compatibility condition. They were insufficient to establish player compatibility.
 
-Zuna SUB and Yuki SUB/DUB retain launch precedence when advertised. Actual readiness decides the winner, so a faster validated alternative may beat the preferred provider. Only one backend is returned to Seanime. New backend names require no title-specific changes. No opposite-mode providers, speculative proxy encodings, custom timer goroutines or Node APIs are introduced.
+## Fix and preserved behavior
 
-SUB retains selected-source WebVTT tracks and defaults to full English when supplied. DUB retains only explicitly forced/signs/songs English captions. No extra subtitle backend requests are made. Empty DUB discovery still produces no source requests, and `$sub`/`$dub` IDs and opposite-server rejection remain intact.
+`probeHlsSource` now requires Seanime-compatible playlist detection at **every** fetched playlist level, before accepting the stream. It checks the actual upstream Content-Type and requested URL path, matching the proxy's detection rule. Incompatible masters or variants reject that candidate; the existing concurrent resolver can choose another advertised provider in the same audio mode.
 
-## Validation
+This is a generic format check, not a Loli/title/hostname ban. Extensionless playlists served with a genuine HLS MIME type remain supported. Media segments served as JPEG remain supported too; this check applies to playlists, not segments. Valid Yuki URLs and headers remain unchanged. No guessed proxy URL encoding is added.
 
-`node --test tests/provider.test.cjs`: **33 tests passed**. They cover the two reported failures with unresolved primary fetches, a hung HLS probe, late valid responses, in-flight refresh sharing, first-segment failures, mode separation, captions, redirects, signed-URL preservation and capped candidate count. The hung-request regressions execute in a VM without timers or AbortController and return before the stalled fetch resolves.
+The 1.0.20 behavior is retained: at most four advertised same-mode providers run concurrently, one validated backend is returned, losing requests cannot start more work after selection, and overlapping same-VM refreshes share pending work. Source responses arriving after an ignored HTTP timeout receive a fresh probe budget. SUB/DUB-tagged IDs, empty DUB discovery, selected-source English SUB captions and forced-only English DUB captions remain intact.
 
-From `tests/goja`, `go test -v .`: **3 tests passed** against the pinned real Goja engine. The new regression leaves Yuki's native promise unresolved, returns Nero 504, verifies Loli DUB is selected, then resolves late Yuki and verifies no new request starts. The timeout parser/loopback test reproduces the host int/int64 defect and verifies actual response-body cancellation at approximately 1 second when corrected. This is an engine/transport test, not an installed-app playback test.
+Changed files: `Provider.js` (`probeHlsSource`), `Manifest.json` (1.0.21), JavaScript/Goja regression tests and this report.
 
-Final live checks deliberately ignored every `fetch.timeout` value and used the affected host's 35-second HTTP cap. All selected streams passed master/variant/first-segment checks. All supplied selected English captions fetched as valid WebVTT. No video segment bodies were fetched.
+## Verification
 
-| Title / episode | Mode | Selected | Resolution time | Captions returned |
+- `node --test tests/provider.test.cjs`: **36 passed**. Three new tests cover an extensionless JPEG master containing `.m3u8` only in its query, an incompatible extensionless variant of a valid master, and a supported extensionless HLS-MIME playlist with JPEG media segments.
+- From `tests/goja`, `go test -count=1 -v .`: **4 passed**, uncached. The new real-Goja regression reproduces the Loli response despite its API `source.type=mpegurl`, confirms rejection, and selects Yuki. Other tests retain hung-request fallback and native-timeout-parser coverage.
+- Current Seanime proxy source and real upstream playlist headers/body were inspected together. The incompatible Loli master and variant each returned HTTP 200 with image/jpeg and extensionless paths, reproducing the exact reason that the local `/cdn` 404 occurs.
+- Live public-method checks used a Seanime-shaped adapter that deliberately ignores numeric fetch timeout values. Every selected result passed master, variant and segment HEAD checks, retained the API stream URL, and used the requested audio type:
+
+| Title / episode | Mode | Selected | Resolution | Captions |
 | --- | --- | --- | --- | --- |
-| The Yakuza's Guide to Babysitting / 9 | DUB | Loli | 1.18 s | None supplied |
-| Screenshot title (`saijo-no-osewa-...-5r98a`) / 2 | SUB | Yuki | 1.25 s | 9; English default |
-| Naruto / 1 | SUB | Yuki | 1.24 s | English |
-| Naruto / 1 | DUB | Yuki | 1.27 s | No explicitly forced track |
-| Hell Mode S2 / 7 | SUB | Yuki | 1.22 s | English |
-| Hell Mode S2 / 7 | DUB | Yuki | 1.32 s | Forced English |
-| Hajime no Ippo / 1 | SUB | Yuki | 1.15 s | Upstream tracks null |
-| Hajime no Ippo / 1 | DUB | Yuki | 1.12 s | Upstream tracks null |
-| Akira / 1 | SUB | Loli | 1.19 s | None supplied |
-| Akira / 1 | DUB | Yuki | 1.37 s | No explicitly forced track |
+| The Yakuza's Guide to Babysitting / 9 | DUB | Yuki | 1.50 s | None explicitly forced |
+| Screenshot title (`saijo-no-osewa-...-5r98a`) / 2 | SUB | Yuki | 1.53 s | 9; English default |
+| Naruto / 1 | DUB | Yuki | 1.13 s | None explicitly forced |
+| Hell Mode S2 / 7 | SUB | Yuki | 1.53 s | English default |
+| Akira / 1 | SUB | Yuki | 1.39 s | English default |
 
-Returned stream URLs were unchanged from their selected API responses in all ten cases. Earlier exploratory calls also observed intermittent upstream 500s, slow 10–19-second source responses and Sora segment 403s; the final success matrix does not establish that the service is always healthy.
+All selected English subtitle files fetched successfully as WebVTT. No video segment bodies were downloaded. No Seanime process was available in this execution environment, so the installed player's decoded audio, caption synchronization and sustained playback were not directly verified.
 
 ## Runtime limits
 
-The parallel fallback works on the affected runtime without rebuilding Seanime. The optional `seanime-fetch-timeout.patch` remains useful for genuine HTTP cancellation, but it is no longer required to prevent one stuck candidate from blocking another healthy candidate.
+Affected Seanime hosts still ignore numeric fetch timeouts due to Go int/int64 conversion. The concurrent fallback does not require a host rebuild when another admitted provider is healthy. The optional companion timeout patch remains available for real HTTP cancellation. Already-issued losing HTTP requests finish or reach the host timeout; the provider ignores their results. If discovery or every upstream provider is unavailable, the extension cannot manufacture a working stream or promise a short wall-clock timeout. HEAD availability is not a sustained-throughput benchmark.
 
-The extension cannot cancel in-flight HTTP requests on that host. Already-issued losing requests may finish at the host's native timeout; their results are ignored. If discovery itself stalls or every candidate is unavailable, this extension cannot guarantee a short wall-clock timeout or create a working upstream stream. Candidate count, retry count and playlist traversal remain finite. No elapsed-budget claim is presented as network cancellation.
+Primary source checks:
 
-Actual decoded audio, caption synchronization, burned-in subtitles and sustained playback in the installed player were not verified. A HEAD check is an availability check, not a throughput benchmark; mid-playback buffering cannot trigger an extension callback.
-
-Primary runtime sources checked again on October 17:
-
-- [Fetch timeout parsing, HEAD support and buffered bodies](https://github.com/5rahim/seanime/blob/main/internal/goja/goja_bindings/fetch.go)
-- [Provider VM bindings and instance lifecycle](https://github.com/5rahim/seanime/blob/main/internal/extension_repo/goja_base.go)
-- [Shared provider bindings](https://github.com/5rahim/seanime/blob/main/internal/extension_repo/goja.go)
-- [EpisodeServer and subtitle types](https://github.com/5rahim/seanime/blob/main/internal/extension/hibike/onlinestream/types.go)
+- [Seanime proxy playlist detection and rewriting](https://github.com/5rahim/seanime/blob/main/internal/handlers/proxy.go)
+- [Fetch timeout parsing and buffered bodies](https://github.com/5rahim/seanime/blob/main/internal/goja/goja_bindings/fetch.go)
+- [Provider VM lifecycle](https://github.com/5rahim/seanime/blob/main/internal/extension_repo/goja_base.go)
+- [EpisodeServer/subtitle schema](https://github.com/5rahim/seanime/blob/main/internal/extension/hibike/onlinestream/types.go)

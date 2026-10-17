@@ -406,6 +406,16 @@ class Provider {
       if (!response.ok) throw new Error("HLS playlist HTTP " + response.status);
       const body = String(await response.text()).replace(/^\uFEFF/, "").trim();
       if (!/^#EXTM3U(?:\s|$)/.test(body)) throw new Error("Invalid HLS playlist");
+      // Seanime's proxy recognizes a playlist by the requested URL PATH or
+      // upstream Content-Type, not the source.type field or URL query. An
+      // extensionless /cdn/token served as image/jpeg passes a body probe but
+      // is proxied verbatim: relative URIs then hit Seanime itself and 404.
+      // Check every level, including extensionless variants of valid masters.
+      const contentType = String(response.contentType || (response.headers &&
+        (response.headers["Content-Type"] || response.headers["content-type"])) || "");
+      if (!/mpegurl/i.test(contentType) && !/\.m3u8$/i.test(current.split(/[?#]/)[0])) {
+        throw new Error("HLS playlist is incompatible with Seanime proxy: no HLS Content-Type or .m3u8 path");
+      }
       const base = response.url || current;
       const lines = body.split(/\r?\n/).map(function (line) { return line.trim(); });
       // Seanime cannot force an HLS audio rendition through EpisodeServer.
