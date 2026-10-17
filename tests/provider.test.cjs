@@ -34,6 +34,9 @@ function createHarness(route) {
       if (result === undefined && ['video.example', 'cdn.example'].includes(parsed.hostname) && parsed.pathname.endsWith('.m3u8')) {
         result = { text: '#EXTM3U\n#EXTINF:6.0,\npart-0001.ts\n#EXT-X-ENDLIST\n' };
       }
+      if (result === undefined && ['video.example', 'cdn.example'].includes(parsed.hostname) && options.method === 'HEAD') {
+        result = { text: '', headers: { 'Content-Type': 'video/mp2t' } };
+      }
       if (result === undefined) throw new Error('Unexpected fetch: ' + parsed.origin + parsed.pathname);
       const status = result.status === undefined ? 200 : result.status;
       const headers = Object.assign({}, result.headers || {});
@@ -125,19 +128,21 @@ test('Hell Mode can select Yuki independently in both modes without fabricating 
     const result = await h.provider.findEpisodeServer({ id: 'hell-mode-season-2-episode-7$' + mode }, 'AnimeX ' + mode);
     assert.equal(result.server, 'yuki');
     assert.equal(result.videoSources[0].url, 'https://video.example/' + mode + '.m3u8');
-    assert.deepEqual(requestModes(h), [mode + ':yuki']);
+    assert.deepEqual(requestModes(h), mode === 'sub' ? ['sub:yuki', 'sub:sora'] : ['dub:yuki']);
   }
 });
 
-test('healthy Zuna remains preferred and probes master, variant and segment with playback headers', async () => {
+test('healthy fast Zuna wins and probes master, variant and segment with playback headers', async () => {
   const h = createHarness((url, options) => {
     if (isAPI(url, 'servers')) return { json: { subProviders: ['sora', 'yuki', 'zuna'], dubProviders: ['yuki'] } };
-    if (isAPI(url, 'sources')) return { json: Object.assign(stream(masterURL), { headers: { 'X-Playback': 'test-value' } }) };
+    if (isAPI(url, 'sources')) return url.searchParams.get('providerId') === 'zuna'
+      ? { json: Object.assign(stream(masterURL), { headers: { 'X-Playback': 'test-value' } }) }
+      : new Promise(() => {});
     return hlsResponse(url, options);
   });
   const result = await h.provider.findEpisodeServer({ id: 'naruto-episode-1$sub' }, 'AnimeX Sub');
   assert.equal(result.server, 'zuna');
-  assert.deepEqual(requestModes(h), ['sub:zuna']);
+  assert.deepEqual(requestModes(h), ['sub:zuna', 'sub:yuki', 'sub:sora']);
   const probes = h.calls.filter(call => new URL(call.url).hostname === 'hls.1embed.buzz');
   assert.deepEqual(probes.map(call => call.url), [masterURL, variantURL, segmentURL]);
   for (const probe of probes) assert.deepEqual(probe.options.headers, plain(result.headers));
@@ -149,20 +154,30 @@ test('healthy Zuna remains preferred and probes master, variant and segment with
 
 for (const failedStage of ['master', 'malformed-master', 'variant', 'segment']) {
   test('Zuna ' + failedStage + ' failure automatically falls back to advertised Yuki SUB', async () => {
+    let releaseFallback;
+    const fallbackReady = new Promise(resolve => { releaseFallback = resolve; });
     const h = createHarness((url, options) => {
       if (isAPI(url, 'servers')) return { json: { subProviders: ['sora', 'zuna', 'yuki'], dubProviders: ['neko'] } };
-      if (isAPI(url, 'sources')) return { json: url.searchParams.get('providerId') === 'zuna' ? stream(masterURL) : {
-        ...stream(), tracks: [{ file: 'https://subs.example/yuki-en.vtt', label: 'English', kind: 'captions' }],
-      } };
+      if (isAPI(url, 'sources')) {
+        if (url.searchParams.get('providerId') === 'zuna') return { json: stream(masterURL) };
+        if (url.searchParams.get('providerId') !== 'yuki') return { status: 503 };
+        return fallbackReady.then(() => ({ json: { ...stream(), tracks: [
+          { file: 'https://subs.example/yuki-en.vtt', label: 'English', kind: 'captions' },
+        ] } }));
+      }
       if ((failedStage === 'master' && url.href === masterURL) ||
           (failedStage === 'variant' && url.href === variantURL) ||
-          (failedStage === 'segment' && url.href === segmentURL)) return { status: 503, text: '' };
-      if (failedStage === 'malformed-master' && url.href === masterURL) return { text: '<html>Access denied</html>' };
+          (failedStage === 'segment' && url.href === segmentURL)) {
+        releaseFallback(); return { status: 503, text: '' };
+      }
+      if (failedStage === 'malformed-master' && url.href === masterURL) {
+        releaseFallback(); return { text: '<html>Access denied</html>' };
+      }
       return hlsResponse(url, options);
     });
     const result = await h.provider.findEpisodeServer({ id: 'hajime-no-ippo-episode-1$sub' }, 'AnimeX Sub');
     assert.equal(result.server, 'yuki');
-    assert.deepEqual(requestModes(h), ['sub:zuna', 'sub:yuki']);
+    assert.deepEqual(requestModes(h), ['sub:zuna', 'sub:yuki', 'sub:sora']);
     assert.equal(result.videoSources[0].subtitles[0].url, 'https://subs.example/yuki-en.vtt');
   });
 }
@@ -177,6 +192,88 @@ test('Zuna source API failure retains the remaining advertised sub candidates', 
   assert.deepEqual(requestModes(h), ['sub:zuna', 'sub:yuki']);
 });
 
+test('reported Yakuza failure: hung Yuki and 504 Nero cannot block healthy Loli DUB', { timeout: 1000 }, async () => {
+  let finishYuki;
+  const hangingYuki = new Promise(resolve => { finishYuki = resolve; });
+  const h = createHarness(url => {
+    if (isAPI(url, 'servers')) return { json: { subProviders: ['nero', 'yuki', 'loli'], dubProviders: ['nero', 'yuki', 'loli', 'sora'] } };
+    if (isAPI(url, 'sources')) {
+      const provider = url.searchParams.get('providerId');
+      if (provider === 'yuki') return hangingYuki;
+      if (provider === 'nero') return { status: 504 };
+      if (provider === 'sora') return { status: 500 };
+      return { json: stream('https://video.example/loli.m3u8') };
+    }
+  });
+  const result = await h.provider.findEpisodeServer({ id: 'the-yakuzas-guide-to-babysitting-juezt-episode-9$dub' }, 'AnimeX Dub');
+  assert.equal(result.server, 'loli');
+  assert.deepEqual(requestModes(h), ['dub:yuki', 'dub:nero', 'dub:loli', 'dub:sora']);
+  const callsAtSelection = h.calls.length;
+  finishYuki({ json: stream('https://late.example/master.m3u8') });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.calls.length, callsAtSelection, 'late losers must not start playlist probes or retries');
+  assert.equal(h.provider.healthCache['the-yakuzas-guide-to-babysitting-juezt|9|dub|yuki'], undefined);
+});
+
+test('reported screenshot failure: hung Nero cannot block healthy Yuki SUB and its English captions', { timeout: 1000 }, async () => {
+  const h = createHarness(url => {
+    if (isAPI(url, 'servers')) return { json: { subProviders: ['nero', 'yuki', 'loli', 'sora'], dubProviders: [] } };
+    if (isAPI(url, 'sources')) {
+      if (url.searchParams.get('providerId') !== 'yuki') return new Promise(() => {});
+      return { json: { ...stream(), tracks: [{ file: 'https://subs.example/en.vtt', lang: 'english (cr)', kind: 'captions' }] } };
+    }
+  });
+  const result = await h.provider.findEpisodeServer({ id: 'saijo-no-osewa-fixture-episode-2$sub' }, 'AnimeX Sub');
+  assert.equal(result.server, 'yuki');
+  assert.equal(result.videoSources[0].subtitles[0].language, 'en');
+  assert.equal(result.videoSources[0].subtitles[0].isDefault, true);
+  assert.ok(requestModes(h).every(mode => mode.startsWith('sub:')));
+});
+
+test('a hanging Zuna HLS probe cannot block an advertised healthy Yuki', { timeout: 1000 }, async () => {
+  const h = createHarness(url => {
+    if (isAPI(url, 'servers')) return { json: { subProviders: ['zuna', 'yuki'] } };
+    if (isAPI(url, 'sources')) return { json: url.searchParams.get('providerId') === 'zuna' ? stream(masterURL) : stream() };
+    if (url.href === masterURL) return new Promise(() => {});
+  });
+  const result = await h.provider.findEpisodeServer({ id: 'fixture-episode-1$sub' }, 'AnimeX Sub');
+  assert.equal(result.server, 'yuki');
+});
+
+test('a valid late source gets a fresh probe budget instead of being discarded by an expired selection deadline', async () => {
+  const h = createHarness((url, options, clock) => {
+    if (isAPI(url, 'servers')) return { json: { dubProviders: ['yuki'] } };
+    if (isAPI(url, 'sources')) { clock.advance(23000); return { json: stream() }; }
+  });
+  const result = await h.provider.findEpisodeServer({ id: 'fixture-episode-1$dub' }, 'AnimeX Dub');
+  assert.equal(result.server, 'yuki');
+  assert.equal(h.elapsed(), 23000);
+});
+
+test('overlapping refresh requests share one in-flight selection in the same VM', async () => {
+  const h = createHarness(url => {
+    if (isAPI(url, 'servers')) return { json: { dubProviders: ['yuki'] } };
+    if (isAPI(url, 'sources')) return { json: stream() };
+  });
+  const [first, second] = await Promise.all([
+    h.provider.findEpisodeServer({ id: 'fixture-episode-1$dub' }, 'AnimeX Dub'),
+    h.newProvider().findEpisodeServer({ id: 'fixture-episode-1$dub' }, 'AnimeX Dub'),
+  ]);
+  assert.deepEqual(plain(first), plain(second));
+  assert.equal(h.calls.filter(call => isAPI(new URL(call.url), 'servers')).length, 1);
+  assert.deepEqual(requestModes(h), ['dub:yuki']);
+});
+
+test('all advertised providers failing returns a finite useful error without exposing signed URLs', { timeout: 1000 }, async () => {
+  const h = createHarness(url => {
+    if (isAPI(url, 'servers')) return { json: { subProviders: ['nero', 'yuki', 'loli', 'sora'] } };
+    throw new Error('Gateway timeout for https://secret.example/?token=do-not-log');
+  });
+  await assert.rejects(() => h.provider.findEpisodeServer({ id: 'fixture-episode-2$sub' }, 'AnimeX Sub'), /no playable SUB/);
+  assert.equal(sources(h).length, 4);
+  assert.ok(h.logs.every(log => !log.includes('do-not-log') && !log.includes('secret.example')));
+});
+
 test('Naruto Yuki DUB preserves the signed source URL and response playback headers', async () => {
   const workingURL = 'https://cdn.example/naruto/master.m3u8?token=AbC%2Fdef%2Bghi&expires=1900000000';
   const workingHeaders = { Referer: 'https://working-player.example/embed/one', Origin: 'https://working-player.example', 'X-Token': 'header-token' };
@@ -189,7 +286,7 @@ test('Naruto Yuki DUB preserves the signed source URL and response playback head
   assert.equal(result.videoSources[0].url, workingURL);
   assert.equal(result.videoSources[0].type, 'm3u8');
   assert.deepEqual(plain(result.headers), workingHeaders);
-  assert.deepEqual(requestModes(h), ['dub:yuki']);
+  assert.deepEqual(requestModes(h), ['dub:yuki', 'dub:sora']);
   assert.ok(!h.calls.some(call => call.url.includes('/uwu/') || call.url.includes('cdnx.aniwatchtv.site')));
 });
 
@@ -292,7 +389,7 @@ test('a short Zuna probe timeout leaves time to try Yuki SUB', async () => {
     'Goja fetch requires a short native timeout in seconds');
 });
 
-test('selection is bounded by a shared deadline instead of sequentially timing out every provider', async () => {
+test('candidate cap prevents probing a long list of dead providers', async () => {
   const advertised = ['zuna', 'yuki', 'sora', 'neko', 'kiwi', 'mimi', 'miku', 'uwu', 'shiro', 'mochi'];
   const h = createHarness((url, options, clock) => {
     if (isAPI(url, 'servers')) return { json: { subProviders: advertised, dubProviders: [] } };
@@ -304,7 +401,8 @@ test('selection is bounded by a shared deadline instead of sequentially timing o
   await assert.rejects(() => h.provider.findEpisodeServer({ id: 'some-title-episode-1$sub' }, 'AnimeX Sub'));
   assert.ok(sources(h).length > 0, 'must attempt advertised candidates before rejecting');
   assert.ok(h.elapsed() <= 12000, 'total simulated network wait was ' + h.elapsed() + 'ms');
-  assert.ok(sources(h).length < advertised.length, 'must stop trying candidates when the shared budget expires');
+  assert.ok(sources(h).length < advertised.length, 'must stop at the configured candidate cap');
+  assert.ok(sources(h).length <= 4, 'must start at most four advertised candidates');
   assert.ok(requestModes(h).every(value => value.startsWith('sub:')));
   for (const call of h.calls) {
     assert.ok(Number.isFinite(call.options.timeout) && call.options.timeout > 0 && call.options.timeout <= 4,
@@ -317,7 +415,7 @@ test('redirected Zuna masters resolve relative variant and segment URLs against 
   const redirectedVariant = 'https://redirect.example/hls/low/index.m3u8?sig=low';
   const redirectedSegment = 'https://redirect.example/hls/segments/one.ts?sig=segment';
   const h = createHarness((url, options) => {
-    if (isAPI(url, 'servers')) return { json: { subProviders: ['zuna', 'yuki'], dubProviders: [] } };
+    if (isAPI(url, 'servers')) return { json: { subProviders: ['zuna'], dubProviders: [] } };
     if (isAPI(url, 'sources')) return { json: stream(masterURL) };
     if (url.href === masterURL) return { url: redirectedMaster, text: '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=200000\n../low/index.m3u8?sig=low\n' };
     if (url.href === redirectedVariant) return { text: '#EXTM3U\n#EXTINF:5,\n../segments/one.ts?sig=segment\n' };
@@ -381,7 +479,7 @@ test('discovery transport failure uses only the conservative same-mode fallback'
   });
   const result = await h.provider.findEpisodeServer({ id: 'fixture-episode-1$dub' }, 'AnimeX Dub');
   assert.equal(result.server, 'yuki');
-  assert.deepEqual(requestModes(h), ['dub:yuki']);
+  assert.deepEqual(requestModes(h), ['dub:yuki', 'dub:sora']);
 });
 
 test('health cache survives the fresh Provider instances created by Seanime', async () => {

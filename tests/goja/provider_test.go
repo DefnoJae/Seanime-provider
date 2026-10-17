@@ -66,7 +66,7 @@ func TestProviderInPinnedGoja(t *testing.T) {
 	if result["server"] != "yuki" {
 		t.Fatal(result)
 	}
-	if len(calls) != 5 {
+	if len(calls) != 6 {
 		t.Fatalf("expected servers, two source requests and two probes: %v", calls)
 	}
 	t.Log("Provider ran in pinned Goja without timers, AbortController, URL or Node APIs; Zuna 503 fell back to Yuki SUB")
@@ -106,8 +106,87 @@ func TestTimeoutParserAndBodyDeadline(t *testing.T) {
 		defer response.Body.Close()
 		_, err = io.ReadAll(response.Body)
 	}
-	if err == nil || time.Since(started) > 2*time.Second {
+	if err == nil || !os.IsTimeout(err) || time.Since(started) > 2*time.Second {
 		t.Fatalf("body not cancelled in time: %v", err)
 	}
 	t.Logf("Original parser uses %ds; fixed parser cancels body at %v", old, time.Since(started))
+}
+
+func TestHungCandidatesDoNotBlockGoja(t *testing.T) {
+	code, err := os.ReadFile("../../Provider.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vm := goja.New()
+	vm.Set("console", map[string]interface{}{"log": func(...interface{}) {}})
+	var finishYuki func(interface{}) error
+	calls := []string{}
+	vm.Set("fetch", func(call goja.FunctionCall) goja.Value {
+		url := call.Argument(0).String()
+		calls = append(calls, url)
+		if strings.Contains(url, "/sources?") && strings.Contains(url, "providerId=yuki") {
+			p, resolve, _ := vm.NewPromise()
+			finishYuki = resolve
+			return vm.ToValue(p)
+		}
+		status := 200
+		var payload interface{}
+		body := ""
+		switch {
+		case strings.Contains(url, "/servers?"):
+			payload = map[string]interface{}{"dubProviders": []string{"nero", "yuki", "loli"}}
+		case strings.Contains(url, "providerId=nero"):
+			status = 504
+		case strings.Contains(url, "providerId=loli"):
+			payload = map[string]interface{}{"sources": []interface{}{map[string]interface{}{"url": "https://good.example/stream.m3u8"}}}
+		case strings.Contains(url, "good.example"):
+			body = "#EXTM3U\n#EXTINF:6,\nsegment.ts\n"
+		default:
+			t.Fatalf("unexpected request %s", url)
+		}
+		o := vm.NewObject()
+		o.Set("ok", status == 200)
+		o.Set("status", status)
+		o.Set("url", url)
+		o.Set("headers", map[string]string{})
+		o.Set("text", func() string { return body })
+		o.Set("json", func() interface{} { return payload })
+		return o
+	})
+	if _, err = vm.RunString(string(code)); err != nil {
+		t.Fatal(err)
+	}
+	v, err := vm.RunString(`new Provider().findEpisodeServer({id:"yakuza-episode-9$dub"},"AnimeX Dub")`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := v.Export().(*goja.Promise)
+	if p.State() != goja.PromiseStateFulfilled {
+		t.Fatalf("selection waited for hung Yuki: %v", p.State())
+	}
+	result := p.Result().Export().(map[string]interface{})
+	if result["server"] != "loli" {
+		t.Fatal(result)
+	}
+	before := len(calls)
+	if finishYuki == nil {
+		t.Fatal("Yuki was not attempted")
+	}
+	late := vm.NewObject()
+	late.Set("ok", true)
+	late.Set("status", 200)
+	late.Set("json", func() interface{} {
+		return map[string]interface{}{"sources": []interface{}{map[string]interface{}{"url": "https://late.example/master.m3u8"}}}
+	})
+	if err := finishYuki(late); err != nil {
+		t.Fatal(err)
+	}
+	// Flush jobs on the same goroutine, as a host dispatch loop must do.
+	if _, err = vm.RunString("void 0"); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != before {
+		t.Fatal("late loser issued more requests")
+	}
+	t.Log("Real Goja returned Loli DUB while Yuki promise remained unresolved; late Yuki issued no follow-up requests")
 }

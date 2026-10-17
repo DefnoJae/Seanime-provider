@@ -7,7 +7,7 @@ class Provider {
     this.SERVER_TIMEOUT_MS = 3000;
     this.SOURCE_TIMEOUT_MS = 4000;
     this.PROBE_TIMEOUT_MS = 3000;
-    this.SELECTION_TIMEOUT_MS = 12000;
+    this.MAX_CANDIDATES = 4;
     // Seanime constructs a Provider for each call but reuses the VM/class.
     if (!Provider.healthCache) Provider.healthCache = Object.create(null);
     this.healthCache = Provider.healthCache;
@@ -55,12 +55,14 @@ class Provider {
   async fetchBefore(url, options, deadline) {
     // Seanime's documented timeout is in whole SECONDS. Affected host builds
     // ignore JS numbers (Go int/int64 mismatch); see docs/validation.md and the
-    // companion host patch. On those builds an in-flight request can take 35s.
-    // The elapsed checks still prevent starting more work after the budget.
+    // companion host patch. Parallel candidates prevent one stuck source from
+    // blocking a healthy alternative even when the host ignores this option.
     const timeout = Math.floor((deadline - Date.now()) / 1000);
     if (timeout < 1) throw new Error("Request time budget exhausted");
     const config = Object.assign({}, options || {}, { timeout: timeout });
+    const acceptLateResponse = config.acceptLateResponse === true;
     delete config.deadline;
+    delete config.acceptLateResponse;
     let response;
     try {
       response = await fetch(url, config);
@@ -68,7 +70,9 @@ class Provider {
       // Native errors can contain signed URLs. Keep logs token-free.
       throw new Error("Network request failed or timed out");
     }
-    if (Date.now() >= deadline) throw new Error("Request time budget exhausted");
+    // JSON source responses can still be useful when the host ignored their
+    // timeout. HLS probes retain a strict elapsed check after each operation.
+    if (!acceptLateResponse && Date.now() >= deadline) throw new Error("Request time budget exhausted");
     return response;
   }
 
@@ -177,19 +181,20 @@ class Provider {
     return data || {};
   }
 
-  async getSources(id, episodeNumber, type, providerId, deadline) {
+  async getSources(id, episodeNumber, type, providerId, deadline, state) {
     const url = this.API + "/rest/api/sources?id=" + encodeURIComponent(id) +
       "&epNum=" + encodeURIComponent(episodeNumber) +
       "&type=" + encodeURIComponent(type) +
       "&providerId=" + encodeURIComponent(providerId);
 
-    const maxAttempts = providerId === "yuki" && type === "dub" ? 2 : 1;
+    const maxAttempts = providerId === "yuki" && type === "dub" && (!state || state.total === 1) ? 2 : 1;
     let lastError = null;
     const expires = deadline || Date.now() + this.SOURCE_TIMEOUT_MS;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (state && state.done) throw new Error("Another provider was selected");
       try {
-        return await this.getJSON(url, { deadline: expires });
+        return await this.getJSON(url, { deadline: expires, acceptLateResponse: true });
       } catch (error) {
         lastError = error;
         const message = String(error && error.message || error);
@@ -388,14 +393,16 @@ class Provider {
         .test(String(source.type || source.mimeType || source.format || ""));
   }
 
-  async probeHlsSource(url, headers, deadline, checkSegment, type) {
+  async probeHlsSource(url, headers, deadline, checkSegment, type, state) {
     let current = url;
     // Some backends nest master playlists. Bound traversal and reject cycles.
     const visited = Object.create(null);
     for (let depth = 0; depth < 3; depth++) {
+      if (state && state.done) throw new Error("Another provider was selected");
       if (visited[current]) throw new Error("HLS playlist cycle");
       visited[current] = true;
       const response = await this.fetchBefore(current, { headers: headers }, deadline);
+      if (state && state.done) throw new Error("Another provider was selected");
       if (!response.ok) throw new Error("HLS playlist HTTP " + response.status);
       const body = String(await response.text()).replace(/^\uFEFF/, "").trim();
       if (!/^#EXTM3U(?:\s|$)/.test(body)) throw new Error("Invalid HLS playlist");
@@ -442,6 +449,7 @@ class Provider {
       const segmentUrl = this.absoluteUrl(segment, base);
       if (!segmentUrl) throw new Error("Invalid HLS segment URL");
       if (checkSegment) {
+        if (state && state.done) throw new Error("Another provider was selected");
         // Goja buffers fetch bodies. HEAD avoids a full segment download even
         // when a CDN ignores Range; never retry this probe with GET.
         const head = await this.fetchBefore(segmentUrl, { method: "HEAD", headers: headers }, deadline);
@@ -458,80 +466,131 @@ class Provider {
     throw new Error("HLS playlist nesting limit reached");
   }
 
+  async resolveCandidate(animeId, episodeNumber, type, provider, deadline, state) {
+    const key = [animeId, episodeNumber, type, provider].join("|");
+    const cached = this.healthCache[key];
+    const active = function () {
+      if (state.done) throw new Error("Another provider was selected");
+    };
+    try {
+      active();
+      console.log("[AnimeX] trying type=" + type + " provider=" + provider + " episode=" + episodeNumber);
+      const started = Date.now();
+      const result = await this.getSources(animeId, episodeNumber, type, provider,
+        Math.min(deadline, started + this.SOURCE_TIMEOUT_MS), state);
+      active();
+      console.log("[AnimeX] " + provider + " source API resolved in " + (Date.now() - started) + "ms");
+      const payload = this.sourcePayload(result);
+      const probeStarted = Date.now();
+      // An ignored HTTP timeout must not discard a usable response or leave it
+      // with zero time to validate playback. Other candidates already run.
+      const probeDeadline = probeStarted + this.PROBE_TIMEOUT_MS;
+      for (let j = 0; j < payload.sources.length && j < 3; j++) {
+        active();
+        const source = payload.sources[j];
+        if (!source || typeof source !== "object") continue;
+        const url = this.absoluteUrl(source.url || source.file || source.link);
+        if (!url) continue;
+        const headers = this.buildPlaybackHeaders(payload, source, provider);
+        const hls = this.isHlsSource(source);
+        try {
+          const fingerprint = url + JSON.stringify(headers);
+          if (!cached || cached.expires <= Date.now() || !cached.healthy || cached.fingerprint !== fingerprint) {
+            if (hls) await this.probeHlsSource(url, headers, probeDeadline, true, type, state);
+            else {
+              const response = await this.fetchBefore(url, { method: "HEAD", headers: headers }, probeDeadline);
+              active();
+              if (!response.ok) throw new Error("Video probe HTTP " + response.status);
+            }
+          }
+          active();
+          const tracks = payload.tracks.concat(Array.isArray(source.tracks) ? source.tracks : [],
+            Array.isArray(source.subtitles) ? source.subtitles : []);
+          const subtitles = this.normalizeSubtitleTracks(tracks, type, url);
+          const video = { url: url, quality: source.quality || source.qualityLabel || source.label || "auto",
+            type: hls ? "m3u8" : "mp4", subtitles: subtitles };
+          this.healthCache[key] = { healthy: true, expires: Date.now() + 30000, fingerprint: fingerprint };
+          return { server: provider, headers: headers, videoSources: [video] };
+        } catch (error) {
+          if (state.done) throw error;
+          console.log("[AnimeX] " + provider + " playback probe failed after " + (Date.now() - probeStarted) +
+            "ms: " + String(error && error.message || "invalid stream"));
+        }
+      }
+      throw new Error("No healthy video source");
+    } catch (error) {
+      // A late loser must not poison the health cache or trigger more requests.
+      if (!state.done) {
+        this.healthCache[key] = { healthy: false, expires: Date.now() + 10000 };
+        console.log("[AnimeX] " + provider + " failed type=" + type + ": " + String(error && error.message || "request failed"));
+      }
+      throw error;
+    }
+  }
+
   async selectHealthyProvider(animeId, episodeNumber, type) {
-    const deadline = Date.now() + this.SELECTION_TIMEOUT_MS;
+    // Share refresh requests inside a reused VM. This is an in-flight cache,
+    // not a long-lived stream URL cache; completed entries are removed.
+    if (!Provider.pendingSelections) Provider.pendingSelections = Object.create(null);
+    const key = [animeId, episodeNumber, type].join("|");
+    const existing = Provider.pendingSelections[key];
+    if (existing && existing.expires > Date.now()) {
+      console.log("[AnimeX] joining in-flight type=" + type + " episode=" + episodeNumber);
+      return await existing.promise;
+    }
+    const entry = { expires: Date.now() + 90000, promise: null };
+    entry.promise = this.raceProviders(animeId, episodeNumber, type);
+    Provider.pendingSelections[key] = entry;
+    try {
+      return await entry.promise;
+    } finally {
+      if (Provider.pendingSelections[key] === entry) delete Provider.pendingSelections[key];
+    }
+  }
+
+  async raceProviders(animeId, episodeNumber, type) {
     let discovered = [];
     let discoveryFailed = false;
     try {
-      const servers = await this.getServers(animeId, episodeNumber, Math.min(deadline, Date.now() + this.SERVER_TIMEOUT_MS));
+      const servers = await this.getServers(animeId, episodeNumber, Date.now() + this.SERVER_TIMEOUT_MS);
       discovered = this.serverProviders(servers, type);
     } catch (error) {
       discoveryFailed = true;
       console.log("[AnimeX] server discovery failed; using limited " + type + " fallback");
     }
-    const candidates = this.orderProviders(discoveryFailed ?
+    const ordered = this.orderProviders(discoveryFailed ?
       (type === "dub" ? ["yuki", "sora"] : ["zuna", "yuki"]) : discovered, type);
+    const candidates = ordered.filter(function (provider) {
+      const cached = this.healthCache[[animeId, episodeNumber, type, provider].join("|")];
+      return !cached || cached.expires <= Date.now() || cached.healthy;
+    }, this).slice(0, this.MAX_CANDIDATES);
     console.log("[AnimeX] mode=" + type + " advertised=" + discovered.join(","));
-    console.log("[AnimeX] candidates=" + candidates.join(","));
-    for (let i = 0; i < candidates.length && Date.now() < deadline - 1000; i++) {
-      const provider = candidates[i];
-      const key = [animeId, episodeNumber, type, provider].join("|");
-      const cached = this.healthCache[key];
-      if (cached && cached.expires > Date.now() && !cached.healthy) continue;
-      try {
-        console.log("[AnimeX] trying type=" + type + " provider=" + provider + " episode=" + episodeNumber);
-        const started = Date.now();
-        const result = await this.getSources(animeId, episodeNumber, type, provider,
-          Math.min(deadline, started + this.SOURCE_TIMEOUT_MS));
-        console.log("[AnimeX] " + provider + " source API resolved in " + (Date.now() - started) + "ms");
-        const payload = this.sourcePayload(result);
-        const probeStarted = Date.now();
-        const probeDeadline = Math.min(deadline, probeStarted + this.PROBE_TIMEOUT_MS);
-        let selected = null;
-        for (let j = 0; j < payload.sources.length && j < 3; j++) {
-          const source = payload.sources[j];
-          if (!source || typeof source !== "object") continue;
-          const url = this.absoluteUrl(source.url || source.file || source.link);
-          if (!url) continue;
-          const headers = this.buildPlaybackHeaders(payload, source, provider);
-          const hls = this.isHlsSource(source);
-          try {
-            // Cache is tied to the precise URL and headers; a new signed URL
-            // never inherits the previous URL's successful playback decision.
-            const fingerprint = url + JSON.stringify(headers);
-            if (!cached || cached.expires <= Date.now() || !cached.healthy || cached.fingerprint !== fingerprint) {
-              if (hls) await this.probeHlsSource(url, headers, probeDeadline, provider === "zuna", type);
-              else {
-                const response = await this.fetchBefore(url, { method: "HEAD", headers: headers }, probeDeadline);
-                if (!response.ok) throw new Error("Video probe HTTP " + response.status);
-              }
-            }
-            const tracks = payload.tracks.concat(Array.isArray(source.tracks) ? source.tracks : [],
-              Array.isArray(source.subtitles) ? source.subtitles : []);
-            const subtitles = this.normalizeSubtitleTracks(tracks, type, url);
-            const video = { url: url, quality: source.quality || source.qualityLabel || source.label || "auto",
-              type: hls ? "m3u8" : "mp4", subtitles: subtitles };
-            selected = { server: provider, headers: headers, videoSources: [video] };
-            this.healthCache[key] = { healthy: true, expires: Date.now() + 30000, fingerprint: fingerprint };
-            break;
-          } catch (error) {
-            console.log("[AnimeX] " + provider + " playback probe failed after " + (Date.now() - probeStarted) +
-              "ms: " + String(error && error.message || "invalid stream"));
-          }
-        }
-        if (selected) {
-          console.log("[AnimeX] selected type=" + type + " provider=" + provider +
+    console.log("[AnimeX] racing candidates=" + candidates.join(","));
+    if (!candidates.length) throw new Error("AnimeX has no available " + type.toUpperCase() + " providers for episode " + episodeNumber + ".");
+    // Do not await a preferred API before starting alternatives: affected Goja
+    // hosts ignore timeout and otherwise consume the entire fallback budget.
+    // No timers, Promise.any, Node APIs or unsafe Go callbacks are required.
+    const deadline = Date.now() + this.SOURCE_TIMEOUT_MS;
+    const state = { done: false, total: candidates.length };
+    const self = this;
+    return await new Promise(function (resolve, reject) {
+      let remaining = candidates.length;
+      candidates.forEach(function (provider) {
+        self.resolveCandidate(animeId, episodeNumber, type, provider, deadline, state).then(function (selected) {
+          if (state.done) return;
+          state.done = true;
+          console.log("[AnimeX] selected type=" + type + " provider=" + selected.server +
             " subtitles=" + selected.videoSources[0].subtitles.length);
-          return selected;
-        }
-        throw new Error("No healthy video source");
-      } catch (error) {
-        this.healthCache[key] = { healthy: false, expires: Date.now() + 10000 };
-        console.log("[AnimeX] " + provider + " failed type=" + type + ": " + String(error && error.message || "request failed"));
-        if (i + 1 < candidates.length) console.log("[AnimeX] falling back to " + candidates[i + 1]);
-      }
-    }
-    throw new Error("AnimeX returned no playable " + type.toUpperCase() + " sources for episode " + episodeNumber + ".");
+          resolve(selected);
+        }, function () {
+          remaining--;
+          if (!state.done && remaining === 0) {
+            state.done = true;
+            reject(new Error("AnimeX returned no playable " + type.toUpperCase() + " sources for episode " + episodeNumber + "."));
+          }
+        });
+      });
+    });
   }
 
   async findEpisodeServer(episode, server) {
